@@ -54,16 +54,32 @@ function defaultState() {
 }
 
 // ── Safe math evaluator ─────────────────────────────────────────────────────
-// Only allows digits, basic operators, parens, dots — no identifiers/strings
+const CONSTANTS = {
+    phi:   (1 + Math.sqrt(5)) / 2,  // golden ratio ≈ 1.618
+    pi:    Math.PI,                  // ≈ 3.14159
+    e:     Math.E,                   // ≈ 2.71828
+    tau:   Math.PI * 2,              // ≈ 6.28318
+    sqrt2: Math.SQRT2,               // ≈ 1.41421
+};
+
 function safeMath(expr) {
-    const cleaned = expr.trim().replace(/\s+/g, '');
+    let cleaned = expr.trim().toLowerCase().replace(/\s+/g, '');
     if (!cleaned) return null;
+
+    // Substitute known constants before whitelist check
+    for (const [name, val] of Object.entries(CONSTANTS)) {
+        cleaned = cleaned.replaceAll(name, `(${val})`);
+    }
+
     // Whitelist: digits, . + - * / ^ ( )
     if (!/^[\d.+\-*/^()]+$/.test(cleaned)) return null;
+
     // Replace ^ with ** for JS exponentiation
     const safe = cleaned.replace(/\^/g, '**');
-    // Guard against things like 2**1000 (huge numbers)
-    if (/\*\*\s*\d{3,}/.test(safe)) return null;
+
+    // Guard against absurdly large exponents
+    if (/\*\*\s*\d{4,}/.test(safe)) return null;
+
     try {
         // eslint-disable-next-line no-new-func
         const result = Function('"use strict"; return (' + safe + ')')();
