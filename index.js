@@ -66,18 +66,13 @@ function safeMath(expr) {
     let cleaned = expr.trim().toLowerCase().replace(/\s+/g, '');
     if (!cleaned) return null;
 
-    // Substitute known constants before whitelist check
     for (const [name, val] of Object.entries(CONSTANTS)) {
         cleaned = cleaned.replaceAll(name, `(${val})`);
     }
 
-    // Whitelist: digits, . + - * / ^ ( )
     if (!/^[\d.+\-*/^()]+$/.test(cleaned)) return null;
 
-    // Replace ^ with ** for JS exponentiation
     const safe = cleaned.replace(/\^/g, '**');
-
-    // Guard against absurdly large exponents
     if (/\*\*\s*\d{4,}/.test(safe)) return null;
 
     try {
@@ -88,6 +83,127 @@ function safeMath(expr) {
     } catch {
         return null;
     }
+}
+
+// ── Expression generator ─────────────────────────────────────────────────────
+function generateExpressions(n) {
+    const candidates = [];
+    const phi = (1 + Math.sqrt(5)) / 2;
+    const pi  = Math.PI;
+    const e   = Math.E;
+    const sqrt2 = Math.SQRT2;
+    const tau = Math.PI * 2;
+
+    // Integer base^exp = n  (e.g. 8 = 2^3)
+    for (let base = 2; base <= 50; base++) {
+        for (let exp = 2; exp <= 8; exp++) {
+            if (Math.pow(base, exp) === n) candidates.push(`${base}^${exp}`);
+        }
+    }
+
+    // Constant powers: round(const^exp) = n  (e.g. phi^10 = 11)
+    const consts = [['phi', phi], ['pi', pi], ['e', e], ['sqrt2', sqrt2], ['tau', tau]];
+    for (const [name, val] of consts) {
+        for (let exp = 1; exp <= 20; exp++) {
+            if (Math.round(Math.pow(val, exp)) === n) {
+                candidates.push(`${name}^${exp}`);
+                break;
+            }
+        }
+    }
+
+    // Constant combos: round(a^b + c) = n
+    for (const [name, val] of consts) {
+        for (let exp = 1; exp <= 10; exp++) {
+            const base = Math.round(Math.pow(val, exp));
+            const diff = n - base;
+            if (diff !== 0 && Math.abs(diff) <= 20) {
+                const sign = diff > 0 ? `+${diff}` : `${diff}`;
+                candidates.push(`${name}^${exp}${sign}`);
+            }
+        }
+    }
+
+    // Multiplication: a*b = n with non-trivial factors
+    if (n > 4) {
+        for (let a = 2; a <= Math.sqrt(n); a++) {
+            if (n % a === 0) {
+                candidates.push(`${a}*${n / a}`);
+                break;
+            }
+        }
+    }
+
+    // Multi-factor: a*b*c
+    if (n > 8) {
+        outer: for (let a = 2; a <= Math.cbrt(n); a++) {
+            if (n % a === 0) {
+                const rest = n / a;
+                for (let b = a; b <= Math.sqrt(rest); b++) {
+                    if (rest % b === 0) {
+                        candidates.push(`${a}*${b}*${rest / b}`);
+                        break outer;
+                    }
+                }
+            }
+        }
+    }
+
+    // Addition: meaningful split (not 50/50)
+    if (n > 2) {
+        const a = Math.max(1, Math.floor(n * 0.35));
+        candidates.push(`${a}+${n - a}`);
+    }
+
+    // Subtraction: (n+k)-k with interesting k
+    if (n >= 1) {
+        const k = Math.round(n * 0.6) + 1;
+        candidates.push(`${n + k}-${k}`);
+    }
+
+    // Division: (n*a)/a
+    if (n >= 1) {
+        const a = n <= 10 ? 2 : 3;
+        candidates.push(`${n * a}/${a}`);
+    }
+
+    // Mixed: a*b+c or a*b-c
+    if (n > 5) {
+        for (let a = 2; a <= 10; a++) {
+            const base = Math.floor(n / a) * a;
+            const diff = n - base;
+            if (base > 0 && diff > 0 && diff < a) {
+                candidates.push(`${a}*${Math.floor(n / a)}+${diff}`);
+                break;
+            }
+        }
+    }
+
+    // Dedupe and pick 3 most interesting (prefer shorter / constant-based)
+    const seen = new Set();
+    const result = [];
+    // Prioritise: constant-based first, then power, then others
+    const sorted = candidates.sort((a, b) => {
+        const aHasConst = /[a-z]/.test(a);
+        const bHasConst = /[a-z]/.test(b);
+        if (aHasConst && !bHasConst) return -1;
+        if (!aHasConst && bHasConst) return 1;
+        return a.length - b.length;
+    });
+
+    for (const c of sorted) {
+        if (!seen.has(c) && result.length < 3) {
+            seen.add(c);
+            result.push(c);
+        }
+    }
+
+    // Fallbacks
+    if (result.length < 3) result.push(`${n - 1}+1`);
+    if (result.length < 3) result.push(`${n * 2}/2`);
+    if (result.length < 3) result.push(`${n + 3}-3`);
+
+    return result.slice(0, 3);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -145,6 +261,16 @@ client.once('ready', async () => {
                 .setName('reset')
                 .setDescription('Manually reset the count to 0 (admin only)')
             ),
+
+        new SlashCommandBuilder()
+            .setName('calculate')
+            .setDescription('Get 3 ways to write a number using math expressions')
+            .addIntegerOption(o => o.setName('number').setDescription('The number to express').setRequired(true).setMinValue(1).setMaxValue(100000)),
+
+        new SlashCommandBuilder()
+            .setName('invite')
+            .setDescription('Get a link to invite this bot to your server'),
+
     ].map(c => c.toJSON());
 
     await client.application.commands.set(commands);
@@ -214,8 +340,7 @@ client.on('messageCreate', async message => {
 
     // ── Consecutive count violation ─────────────────────────────────────────
     if (state.maxStreak > 0 && message.author.id === state.lastUserId) {
-        const streak = state.consecutiveCount;
-        if (streak >= state.maxStreak) {
+        if (state.consecutiveCount >= state.maxStreak) {
             await message.react('❌').catch(() => {});
             const prev = state.current;
             state.current = 0;
@@ -245,7 +370,6 @@ client.on('messageCreate', async message => {
     if (value > state.highScore) state.highScore = value;
     saveState(guildId, state);
 
-    // React with the number if small enough, otherwise ✅
     const numberEmojis = ['0️⃣','1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣'];
     if (value <= 9) {
         await message.react(numberEmojis[value]).catch(() => {});
@@ -253,7 +377,6 @@ client.on('messageCreate', async message => {
         await message.react('✅').catch(() => {});
     }
 
-    // Milestone announcements
     if (value % 100 === 0) {
         await message.channel.send({
             embeds: [E('#00cc88', `🎉 ${value} reached!`)
@@ -273,6 +396,51 @@ client.on('interactionCreate', async interaction => {
     const { commandName, options } = interaction;
 
     try {
+
+        // ── /invite ──────────────────────────────────────────────────────────
+        if (commandName === 'invite') {
+            // Permissions: View Channel, Send Messages, Add Reactions, Read Message History, Manage Messages
+            const perms = 76864n;
+            const url = `https://discord.com/oauth2/authorize?client_id=${client.user.id}&permissions=${perms}&scope=bot%20applications.commands`;
+            return interaction.reply({
+                embeds: [E('#5865F2', '📨 Invite Counting Bot')
+                    .setDescription(`[**Click here to invite me to your server!**](${url})`)
+                    .addFields({
+                        name: '🔐 Permissions requested',
+                        value: '• View Channels\n• Send Messages\n• Add Reactions\n• Read Message History\n• Manage Messages'
+                    })
+                    .setFooter({ text: 'After inviting, use /counting channel to set up!' })
+                ],
+                flags: [MessageFlags.Ephemeral]
+            });
+        }
+
+        // ── /calculate ───────────────────────────────────────────────────────
+        if (commandName === 'calculate') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const n = options.getInteger('number');
+            const exprs = generateExpressions(n);
+
+            const fields = exprs.map((expr, i) => {
+                const verified = safeMath(expr);
+                const label = ['1️⃣', '2️⃣', '3️⃣'][i];
+                return {
+                    name: `${label}  \`${expr}\``,
+                    value: `= **${verified ?? n}**`,
+                    inline: true,
+                };
+            });
+
+            return interaction.editReply({
+                embeds: [E('#5865F2', `🧮 Ways to write ${n}`)
+                    .setDescription(`Here are 3 expressions you can use to count **${n}** in the counting channel:`)
+                    .addFields(...fields)
+                    .setFooter({ text: 'Supports: + - * / ^ pi phi e tau sqrt2' })
+                ]
+            });
+        }
+
+        // ── /counting ────────────────────────────────────────────────────────
         if (commandName === 'counting') {
             if (!hasAdminPermission(interaction)) {
                 return interaction.reply({ content: '❌ You need Administrator permission to configure the counting game.', flags: [MessageFlags.Ephemeral] });
@@ -328,12 +496,12 @@ client.on('interactionCreate', async interaction => {
                 return interaction.editReply({
                     embeds: [E('#5865F2', '📊 Counting Status')
                         .addFields(
-                            { name: '📍 Channel', value: ch, inline: true },
-                            { name: '🔢 Current count', value: `**${state.current}**`, inline: true },
-                            { name: '🏆 High score', value: `**${state.highScore}**`, inline: true },
-                            { name: '🔁 Max streak', value: `**${state.maxStreak}** in a row`, inline: true },
-                            { name: '🧮 Expressions', value: state.allowExpressions ? '✅ Allowed' : '❌ Disabled', inline: true },
-                            { name: '👤 Last counter', value: state.lastUserId ? `<@${state.lastUserId}>` : 'Nobody yet', inline: true },
+                            { name: '📍 Channel',       value: ch,                                               inline: true },
+                            { name: '🔢 Current count', value: `**${state.current}**`,                          inline: true },
+                            { name: '🏆 High score',    value: `**${state.highScore}**`,                        inline: true },
+                            { name: '🔁 Max streak',    value: `**${state.maxStreak}** in a row`,               inline: true },
+                            { name: '🧮 Expressions',   value: state.allowExpressions ? '✅ Allowed' : '❌ Disabled', inline: true },
+                            { name: '👤 Last counter',  value: state.lastUserId ? `<@${state.lastUserId}>` : 'Nobody yet', inline: true },
                         )
                     ]
                 });
