@@ -99,12 +99,6 @@ function E(color, title) {
     return new EmbedBuilder().setColor(color).setTitle(title);
 }
 
-async function reply(interaction, content) {
-    const opts = typeof content === 'string' ? { content, flags: [MessageFlags.Ephemeral] } : { ...content, flags: [MessageFlags.Ephemeral] };
-    if (interaction.deferred) return interaction.editReply(opts);
-    return interaction.reply(opts);
-}
-
 // ── Keep-alive ───────────────────────────────────────────────────────────────
 function keepAlive() {
     const ping = () => {
@@ -281,18 +275,20 @@ client.on('interactionCreate', async interaction => {
     try {
         if (commandName === 'counting') {
             if (!hasAdminPermission(interaction)) {
-                return reply(interaction, '❌ You need Administrator permission to configure the counting game.');
+                return interaction.reply({ content: '❌ You need Administrator permission to configure the counting game.', flags: [MessageFlags.Ephemeral] });
             }
+
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
             const sub = options.getSubcommand();
             const state = await getState(guildId);
 
             if (sub === 'channel') {
                 const ch = options.getChannel('channel');
-                if (!ch.isTextBased()) return reply(interaction, '❌ Please select a text channel.');
+                if (!ch.isTextBased()) return interaction.editReply({ content: '❌ Please select a text channel.' });
                 state.channelId = ch.id;
                 saveState(guildId, state);
-                return reply(interaction, {
+                return interaction.editReply({
                     embeds: [E('#5865F2', '✅ Counting channel set')
                         .setDescription(`The counting channel has been set to ${ch}.\nStart counting from **1**!`)
                     ]
@@ -303,7 +299,7 @@ client.on('interactionCreate', async interaction => {
                 const amount = options.getInteger('amount');
                 state.maxStreak = amount;
                 saveState(guildId, state);
-                return reply(interaction, {
+                return interaction.editReply({
                     embeds: [E('#5865F2', '✅ Max streak updated')
                         .setDescription(amount === 1
                             ? 'Users can no longer count twice in a row.'
@@ -317,7 +313,7 @@ client.on('interactionCreate', async interaction => {
                 const enabled = options.getBoolean('enabled');
                 state.allowExpressions = enabled;
                 saveState(guildId, state);
-                return reply(interaction, {
+                return interaction.editReply({
                     embeds: [E('#5865F2', `✅ Expressions ${enabled ? 'enabled' : 'disabled'}`)
                         .setDescription(enabled
                             ? 'Users can now count with expressions like `1+1`, `3*4`, `2^3`, etc.'
@@ -329,7 +325,7 @@ client.on('interactionCreate', async interaction => {
 
             if (sub === 'status') {
                 const ch = state.channelId ? `<#${state.channelId}>` : 'Not set';
-                return reply(interaction, {
+                return interaction.editReply({
                     embeds: [E('#5865F2', '📊 Counting Status')
                         .addFields(
                             { name: '📍 Channel', value: ch, inline: true },
@@ -350,7 +346,6 @@ client.on('interactionCreate', async interaction => {
                 state.consecutiveCount = 0;
                 saveState(guildId, state);
 
-                // Announce in the counting channel too if it's set
                 if (state.channelId) {
                     const ch = interaction.guild.channels.cache.get(state.channelId);
                     if (ch) ch.send({
@@ -360,7 +355,7 @@ client.on('interactionCreate', async interaction => {
                     }).catch(() => {});
                 }
 
-                return reply(interaction, `✅ Count reset from **${prev}** to 0.`);
+                return interaction.editReply({ content: `✅ Count reset from **${prev}** to 0.` });
             }
         }
 
