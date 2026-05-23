@@ -62,7 +62,7 @@ function defaultState() {
     };
 }
 
-// ── Stats ────────────────────────────────────────────────────────────────────
+// ── Stats DB helpers ─────────────────────────────────────────────────────────
 async function updateUserStat(guildId, userId, delta) {
     try {
         const res = await pool.query('SELECT data FROM user_stats WHERE guild_id = $1 AND user_id = $2', [guildId, userId]);
@@ -101,7 +101,7 @@ async function getServerLeaderboard(guildId) {
     return res.rows;
 }
 
-async function getGlobalLeaderboard() {
+async function getGlobalUserLeaderboard() {
     const res = await pool.query(`
         SELECT user_id,
                SUM(COALESCE((data->>'correct')::int, 0)) AS correct,
@@ -112,6 +112,136 @@ async function getGlobalLeaderboard() {
         LIMIT 10
     `);
     return res.rows;
+}
+
+async function getGlobalServerLeaderboard() {
+    // Ranks servers by their all-time high score stored in the counting table
+    const res = await pool.query(`
+        SELECT guild_id,
+               COALESCE((data->>'highScore')::int, 0)    AS high_score,
+               COALESCE((data->>'current')::int,   0)    AS current_count
+        FROM counting
+        ORDER BY high_score DESC
+        LIMIT 10
+    `);
+    return res.rows;
+}
+
+async function getServerStats(guildId) {
+    const res = await pool.query(`
+        SELECT
+            COUNT(*)                                            AS total_users,
+            SUM(COALESCE((data->>'correct')::int, 0))          AS total_correct,
+            SUM(COALESCE((data->>'ruined')::int,  0))          AS total_ruined
+        FROM user_stats WHERE guild_id = $1
+    `, [guildId]);
+    return res.rows[0] ?? {};
+}
+
+// ── Build embeds ─────────────────────────────────────────────────────────────
+async function buildUserStatsEmbed(guildId, targetUser) {
+    const [stats, rank, state] = await Promise.all([
+        getUserStats(guildId, targetUser.id),
+        getUserRank(guildId, targetUser.id),
+        getState(guildId),
+    ]);
+    const total    = (stats.correct || 0) + (stats.ruined || 0);
+    const accuracy = total > 0 ? Math.round((stats.correct / total) * 100) : 100;
+    return new EmbedBuilder().setColor('#5865F2')
+        .setTitle(`📊 Stats — ${targetUser.username}`)
+        .setThumbnail(targetUser.displayAvatarURL())
+        .addFields(
+            { name: '✅ Correct counts',    value: `**${stats.correct ?? 0}**`, inline: true },
+            { name: '💥 Times ruined',      value: `**${stats.ruined  ?? 0}**`, inline: true },
+            { name: '🎯 Accuracy',          value: `**${accuracy}%**`,          inline: true },
+            { name: '🏅 Server rank',       value: `**#${rank}**`,              inline: true },
+            { name: '🔢 Current count',     value: `**${state.current}**`,      inline: true },
+            { name: '🏆 Server high score', value: `**${state.highScore}**`,    inline: true },
+        );
+}
+
+async function buildServerStatsEmbed(guild) {
+    const [serverStats, state] = await Promise.all([
+        getServerStats(guild.id),
+        getState(guild.id),
+    ]);
+    const totalCounts = parseInt(serverStats.total_correct) || 0;
+    const totalRuined = parseInt(serverStats.total_ruined)  || 0;
+    const totalUsers  = parseInt(serverStats.total_users)   || 0;
+    const grandTotal  = totalCounts + totalRuined;
+    const accuracy    = grandTotal > 0 ? Math.round((totalCounts / grandTotal) * 100) : 100;
+    return new EmbedBuilder().setColor('#5865F2')
+        .setTitle(`📊 Server Stats — ${guild.name}`)
+        .setThumbnail(guild.iconURL())
+        .addFields(
+            { name: '👥 Active counters',  value: `**${totalUsers}**`,     inline: true },
+            { name: '✅ Total correct',    value: `**${totalCounts}**`,    inline: true },
+            { name: '💥 Total ruined',     value: `**${totalRuined}**`,    inline: true },
+            { name: '🎯 Server accuracy',  value: `**${accuracy}%**`,      inline: true },
+            { name: '🔢 Current count',    value: `**${state.current}**`,  inline: true },
+            { name: '🏆 All-time high',    value: `**${state.highScore}**`, inline: true },
+        );
+}
+
+async function buildGlobalUsersEmbed() {
+    const rows   = await getGlobalUserLeaderboard();
+    const medals = ['🥇', '🥈', '🥉'];
+    if (!rows.length) return new EmbedBuilder().setColor('#5865F2').setTitle('🌍 Global Leaderboard — Users').setDescription('No stats yet!');
+    const lines = rows.map((r, i) =>
+        `${medals[i] ?? `**${i+1}.**`} <@${r.user_id}> — **${parseInt(r.correct)}** counts total`
+    );
+    return new EmbedBuilder().setColor('#5865F2')
+        .setTitle('🌍 Global Leaderboard — Users')
+        .setDescription(lines.join('\n'))
+        .setFooter({ text: `Top ${rows.length} counters across all servers` });
+}
+
+async function buildGlobalServersEmbed() {
+    const rows   = await getGlobalServerLeaderboard();
+    const medals = ['🥇', '🥈', '🥉'];
+    if (!rows.length) return new EmbedBuilder().setColor('#5865F2').setTitle('🌍 Global Leaderboard — Servers').setDescription('No stats yet!');
+
+    const lines = await Promise.all(rows.map(async (r, i) => {
+        // Try to resolve the guild name; fall back to the raw ID if not cached
+        let name;
+        try {
+            const guild = client.guilds.cache.get(r.guild_id) ?? await client.guilds.fetch(r.guild_id).catch(() => null);
+            name = guild ? guild.name : `Server ${r.guild_id}`;
+        } catch { name = `Server ${r.guild_id}`; }
+        return `${medals[i] ?? `**${i+1}.**`} **${name}** — 🏆 High score **${r.high_score}** · Current **${r.current_count}**`;
+    }));
+
+    return new EmbedBuilder().setColor('#5865F2')
+        .setTitle('🌍 Global Leaderboard — Servers')
+        .setDescription(lines.join('\n'))
+        .setFooter({ text: `Top ${rows.length} servers by all-time high score` });
+}
+
+// ── Button row builders ──────────────────────────────────────────────────────
+function statsRow(targetUserId, guildId, activePage) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`stats_user_${targetUserId}_${guildId}`)
+            .setLabel('👤 User Stats')
+            .setStyle(activePage === 'user' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId(`stats_server_${targetUserId}_${guildId}`)
+            .setLabel('🏠 Server Stats')
+            .setStyle(activePage === 'server' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    );
+}
+
+function globalLbRow(activePage) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('glb_users')
+            .setLabel('👤 Users')
+            .setStyle(activePage === 'users' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId('glb_servers')
+            .setLabel('🏠 Servers')
+            .setStyle(activePage === 'servers' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    );
 }
 
 // ── Safe math evaluator ──────────────────────────────────────────────────────
@@ -161,7 +291,6 @@ function generateExpressions(n) {
     }
 
     if (n > 4) for (let a = 2; a <= Math.sqrt(n); a++) if (n % a === 0) { candidates.push(`${a}*${n/a}`); break; }
-
     if (n > 8) {
         outer: for (let a = 2; a <= Math.cbrt(n); a++) if (n % a === 0) {
             const rest = n / a;
@@ -169,7 +298,6 @@ function generateExpressions(n) {
                 if (rest % b === 0) { candidates.push(`${a}*${b}*${rest/b}`); break outer; }
         }
     }
-
     if (n > 2) { const a = Math.max(1, Math.floor(n * 0.35)); candidates.push(`${a}+${n-a}`); }
     candidates.push(`${n + Math.round(n * 0.6) + 1}-${Math.round(n * 0.6) + 1}`);
     candidates.push(`${n * (n <= 10 ? 2 : 3)}/${n <= 10 ? 2 : 3}`);
@@ -190,9 +318,8 @@ function generateExpressions(n) {
 
 // ── Help pages ───────────────────────────────────────────────────────────────
 function buildHelpPage(page) {
-    const titles = ['🎮 How to Play', '📋 Commands', '⚙️ Config & Admin', '🧮 Expressions'];
     const embeds = [
-        new EmbedBuilder().setColor('#5865F2').setTitle(titles[0])
+        new EmbedBuilder().setColor('#5865F2').setTitle('🎮 How to Play')
             .setDescription('Count up together in the counting channel! One number at a time — anyone who breaks the chain resets it back to 1.')
             .addFields(
                 { name: '📌 Rules', value: '• Type the next number in the sequence\n• You can\'t count twice in a row (by default)\n• Wrong number? The count resets to 1!\n• Math expressions like `2+2`, `pi^2` are supported' },
@@ -201,15 +328,15 @@ function buildHelpPage(page) {
                 { name: '🏆 Milestones', value: 'The bot celebrates every 100 counts' }
             ).setFooter({ text: 'Page 1/4 • Counting Bot' }),
 
-        new EmbedBuilder().setColor('#5865F2').setTitle(titles[1])
+        new EmbedBuilder().setColor('#5865F2').setTitle('📋 Commands')
             .setDescription('All available commands:')
             .addFields(
                 { name: '🔢 Counting', value: '`/counting channel` — set the counting channel\n`/counting status` — view current count & settings\n`/counting reset` — reset the count *(requires permission)*' },
-                { name: '📊 Stats & Leaderboards', value: '`/stats [user]` — view counting stats for you or someone else\n`/leaderboard server` — top counters in this server\n`/leaderboard global` — top counters across all servers' },
+                { name: '📊 Stats & Leaderboards', value: '`/stats [user]` — view stats with user/server tabs\n`/leaderboard server` — top counters in this server\n`/leaderboard global` — global users & servers tabs' },
                 { name: '🛠️ Utilities', value: '`/calculate <number>` — get 3 expressions for any number\n`/invite` — get the bot invite link\n`/help` — this menu' }
             ).setFooter({ text: 'Page 2/4 • Counting Bot' }),
 
-        new EmbedBuilder().setColor('#5865F2').setTitle(titles[2])
+        new EmbedBuilder().setColor('#5865F2').setTitle('⚙️ Config & Admin')
             .setDescription('Admin & configuration commands. Requires **Administrator** or the configured access role.')
             .addFields(
                 { name: '⚙️ /config maxstreak <n>', value: 'How many times one person can count in a row (1–20). Default: **1**' },
@@ -219,7 +346,7 @@ function buildHelpPage(page) {
                 { name: '🔄 /counting reset', value: 'Manually reset the count back to 0.' }
             ).setFooter({ text: 'Page 3/4 • Counting Bot' }),
 
-        new EmbedBuilder().setColor('#5865F2').setTitle(titles[3])
+        new EmbedBuilder().setColor('#5865F2').setTitle('🧮 Expressions')
             .setDescription('When expressions are enabled, you can type math instead of plain numbers. The result is **rounded** to the nearest whole number.')
             .addFields(
                 { name: '➕ Operators', value: '`+` add  •  `-` subtract  •  `*` multiply  •  `/` divide  •  `^` power' },
@@ -280,9 +407,9 @@ client.once('ready', async () => {
 
         new SlashCommandBuilder().setName('leaderboard').setDescription('View counting leaderboards')
             .addSubcommand(s => s.setName('server').setDescription('Top counters in this server'))
-            .addSubcommand(s => s.setName('global').setDescription('Top counters across all servers')),
+            .addSubcommand(s => s.setName('global').setDescription('Top counters and servers globally')),
 
-        new SlashCommandBuilder().setName('stats').setDescription('View counting stats for a user')
+        new SlashCommandBuilder().setName('stats').setDescription('View counting stats')
             .addUserOption(o => o.setName('user').setDescription('User to check (defaults to yourself)')),
 
         new SlashCommandBuilder().setName('calculate').setDescription('Get 3 ways to write a number using math expressions')
@@ -331,7 +458,6 @@ client.on('messageCreate', async message => {
 
     const expected = state.current + 1;
 
-    // ── Wrong number ─────────────────────────────────────────────────────────
     if (value !== expected) {
         await message.react('❌').catch(() => {});
         const prev = state.current;
@@ -347,7 +473,6 @@ client.on('messageCreate', async message => {
         return;
     }
 
-    // ── Consecutive count violation ───────────────────────────────────────────
     if (state.maxStreak > 0 && message.author.id === state.lastUserId && state.consecutiveCount >= state.maxStreak) {
         await message.react('❌').catch(() => {});
         const prev = state.current;
@@ -363,7 +488,6 @@ client.on('messageCreate', async message => {
         return;
     }
 
-    // ── Correct count ─────────────────────────────────────────────────────────
     const isSameUser = message.author.id === state.lastUserId;
     state.current = value;
     state.lastUserId = message.author.id;
@@ -388,15 +512,62 @@ client.on('messageCreate', async message => {
 client.on('interactionCreate', async interaction => {
     const guildId = interaction.guild?.id;
 
-    // ── Button: help page navigation ──
+    // ── Buttons ───────────────────────────────────────────────────────────────
     if (interaction.isButton()) {
-        if (!interaction.customId.startsWith('help_')) return;
-        const page = parseInt(interaction.customId.split('_')[1]);
-        if (isNaN(page) || page < 1 || page > 4) return;
-        return interaction.update(buildHelpPage(page));
+
+        // Help page navigation
+        if (interaction.customId.startsWith('help_')) {
+            const page = parseInt(interaction.customId.split('_')[1]);
+            if (!isNaN(page) && page >= 1 && page <= 4)
+                return interaction.update(buildHelpPage(page));
+        }
+
+        // Stats tab switching
+        if (interaction.customId.startsWith('stats_')) {
+            await interaction.deferUpdate();
+            const parts        = interaction.customId.split('_');
+            const view         = parts[1];
+            const targetUserId = parts[2];
+            const btnGuildId   = parts[3];
+            try {
+                if (view === 'user') {
+                    const targetUser = await client.users.fetch(targetUserId).catch(() => interaction.user);
+                    const embed = await buildUserStatsEmbed(btnGuildId, targetUser);
+                    return interaction.editReply({ embeds: [embed], components: [statsRow(targetUserId, btnGuildId, 'user')] });
+                }
+                if (view === 'server') {
+                    const guild = client.guilds.cache.get(btnGuildId) ?? await client.guilds.fetch(btnGuildId).catch(() => interaction.guild);
+                    const embed = await buildServerStatsEmbed(guild);
+                    return interaction.editReply({ embeds: [embed], components: [statsRow(targetUserId, btnGuildId, 'server')] });
+                }
+            } catch (e) {
+                console.error('stats button error:', e);
+                return interaction.editReply({ content: '❌ Failed to load stats.' });
+            }
+        }
+
+        // Global leaderboard tab switching
+        if (interaction.customId === 'glb_users' || interaction.customId === 'glb_servers') {
+            await interaction.deferUpdate();
+            try {
+                if (interaction.customId === 'glb_users') {
+                    const embed = await buildGlobalUsersEmbed();
+                    return interaction.editReply({ embeds: [embed], components: [globalLbRow('users')] });
+                }
+                if (interaction.customId === 'glb_servers') {
+                    const embed = await buildGlobalServersEmbed();
+                    return interaction.editReply({ embeds: [embed], components: [globalLbRow('servers')] });
+                }
+            } catch (e) {
+                console.error('global lb button error:', e);
+                return interaction.editReply({ content: '❌ Failed to load leaderboard.' });
+            }
+        }
+
+        return;
     }
 
-    // ── Role select: config access ──
+    // ── Role select: config access ────────────────────────────────────────────
     if (interaction.isRoleSelectMenu()) {
         if (!interaction.customId.startsWith('access_role_')) return;
         const roleId = interaction.values[0];
@@ -452,32 +623,18 @@ client.on('interactionCreate', async interaction => {
         // ── /stats ────────────────────────────────────────────────────────────
         if (commandName === 'stats') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const target = options.getUser('user') ?? interaction.user;
-            const [stats, rank, state] = await Promise.all([
-                getUserStats(guildId, target.id),
-                getUserRank(guildId, target.id),
-                getState(guildId),
-            ]);
-            const total = (stats.correct || 0) + (stats.ruined || 0);
-            const accuracy = total > 0 ? Math.round((stats.correct / total) * 100) : 100;
+            const targetUser = options.getUser('user') ?? interaction.user;
+            const embed = await buildUserStatsEmbed(guildId, targetUser);
             return interaction.editReply({
-                embeds: [E('#5865F2', `📊 Stats — ${target.username}`)
-                    .setThumbnail(target.displayAvatarURL())
-                    .addFields(
-                        { name: '✅ Correct counts',     value: `**${stats.correct ?? 0}**`,  inline: true },
-                        { name: '💥 Times ruined',       value: `**${stats.ruined  ?? 0}**`,  inline: true },
-                        { name: '🎯 Accuracy',           value: `**${accuracy}%**`,           inline: true },
-                        { name: '🏅 Server rank',        value: `**#${rank}**`,               inline: true },
-                        { name: '🔢 Current count',      value: `**${state.current}**`,       inline: true },
-                        { name: '🏆 Server high score',  value: `**${state.highScore}**`,     inline: true },
-                    )]
+                embeds: [embed],
+                components: [statsRow(targetUser.id, guildId, 'user')],
             });
         }
 
         // ── /leaderboard ──────────────────────────────────────────────────────
         if (commandName === 'leaderboard') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const sub = options.getSubcommand();
+            const sub    = options.getSubcommand();
             const medals = ['🥇', '🥈', '🥉'];
 
             if (sub === 'server') {
@@ -494,15 +651,11 @@ client.on('interactionCreate', async interaction => {
             }
 
             if (sub === 'global') {
-                const rows = await getGlobalLeaderboard();
-                if (!rows.length) return interaction.editReply({ content: '📊 No global stats yet!' });
-                const lines = rows.map((r, i) =>
-                    `${medals[i] ?? `**${i+1}.**`} <@${r.user_id}> — **${parseInt(r.correct)}** counts across all servers`
-                );
+                // Open on the Users tab by default
+                const embed = await buildGlobalUsersEmbed();
                 return interaction.editReply({
-                    embeds: [E('#5865F2', '🌍 Global Leaderboard')
-                        .setDescription(lines.join('\n'))
-                        .setFooter({ text: `Top ${rows.length} counters globally` })]
+                    embeds: [embed],
+                    components: [globalLbRow('users')],
                 });
             }
         }
@@ -569,12 +722,12 @@ client.on('interactionCreate', async interaction => {
                 const state = await getState(guildId);
                 return interaction.editReply({
                     embeds: [E('#5865F2', '📊 Counting Status').addFields(
-                        { name: '📍 Channel',       value: state.channelId ? `<#${state.channelId}>` : 'Not set',            inline: true },
-                        { name: '🔢 Current count', value: `**${state.current}**`,                                            inline: true },
-                        { name: '🏆 High score',    value: `**${state.highScore}**`,                                          inline: true },
-                        { name: '🔁 Max streak',    value: `**${state.maxStreak}** in a row`,                                 inline: true },
-                        { name: '🧮 Expressions',   value: state.allowExpressions ? '✅ Allowed' : '❌ Disabled',             inline: true },
-                        { name: '👤 Last counter',  value: state.lastUserId ? `<@${state.lastUserId}>` : 'Nobody yet',        inline: true },
+                        { name: '📍 Channel',       value: state.channelId ? `<#${state.channelId}>` : 'Not set', inline: true },
+                        { name: '🔢 Current count', value: `**${state.current}**`,                                inline: true },
+                        { name: '🏆 High score',    value: `**${state.highScore}**`,                              inline: true },
+                        { name: '🔁 Max streak',    value: `**${state.maxStreak}** in a row`,                     inline: true },
+                        { name: '🧮 Expressions',   value: state.allowExpressions ? '✅ Allowed' : '❌ Disabled', inline: true },
+                        { name: '👤 Last counter',  value: state.lastUserId ? `<@${state.lastUserId}>` : 'Nobody yet', inline: true },
                     )]
                 });
             }
