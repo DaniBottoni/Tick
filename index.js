@@ -326,9 +326,9 @@ function paginationRow(type, ctx, page, totalPages) {
 
 function globalTabRow(activeTab) {
     return new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('lb_gu_p1').setLabel('👤 Users')
+        new ButtonBuilder().setCustomId('lbt_gu').setLabel('👤 Users')
             .setStyle(activeTab === 'gu' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('lb_gs_p1').setLabel('🏠 Servers')
+        new ButtonBuilder().setCustomId('lbt_gs').setLabel('🏠 Servers')
             .setStyle(activeTab === 'gs' ? ButtonStyle.Primary : ButtonStyle.Secondary),
     );
 }
@@ -684,6 +684,24 @@ client.on('interactionCreate', async interaction => {
                     return interaction.editReply({ embeds: [await buildServerStatsEmbed(g)], components: [statsRow(tuid, bgid, 'server')] });
                 }
             } catch (e) { console.error('stats button:', e); return interaction.editReply({ content: '❌ Failed to load stats.' }); }
+        }
+
+        // Global leaderboard tab buttons (lbt_ prefix avoids colliding with pagination lb_ buttons)
+        if (interaction.customId === 'lbt_gu' || interaction.customId === 'lbt_gs') {
+            await interaction.deferUpdate();
+            try {
+                if (interaction.customId === 'lbt_gu') {
+                    const { embed, totalPages } = await buildGlobalUsersEmbed(1);
+                    return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, totalPages)] });
+                }
+                if (interaction.customId === 'lbt_gs') {
+                    const { embed, totalPages } = await buildGlobalServersEmbed(1);
+                    return interaction.editReply({ embeds: [embed], components: [globalTabRow('gs'), paginationRow('gs', '', 1, totalPages)] });
+                }
+            } catch (e) {
+                console.error('global tab button:', e);
+                await interaction.editReply({ content: '❌ Failed to load leaderboard. Try again in a moment.' }).catch(() => {});
+            }
         }
 
         // Leaderboard pagination — customId format: lb_{type}[_{ctx}]_p{N} or lb_{type}[_{ctx}]_info
