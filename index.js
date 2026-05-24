@@ -12,7 +12,12 @@ const client = new Client({
         GatewayIntentBits.MessageContent,
     ]
 });
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    statement_timeout: 8000,       // kill queries that hang over 8s
+    connectionTimeoutMillis: 5000, // fail fast if no connection available
+});
 
 // Pending saves: keyed by prompt message ID
 const pendingSaves = new Map();
@@ -683,19 +688,17 @@ client.on('interactionCreate', async interaction => {
 
         // Leaderboard pagination — customId format: lb_{type}[_{ctx}]_p{N} or lb_{type}[_{ctx}]_info
         if (interaction.customId.startsWith('lb_')) {
+            // Parse BEFORE deferring so we can bail cleanly without leaving Discord stuck
+            const id      = interaction.customId;
+            const lastSeg = id.split('_').pop();
+            // Disabled info button — just ack with no visual change
+            if (lastSeg === 'info') return interaction.deferUpdate();
+            const page = parseInt(lastSeg.replace('p', ''));
+            if (isNaN(page) || page < 1) return interaction.deferUpdate();
+            const seg2 = id.split('_')[1];
+
             await interaction.deferUpdate();
             try {
-                const id = interaction.customId; // e.g. lb_gu_p2, lb_sv_123456_p3, lb_hs_p1
-
-                // Parse page number from the last segment
-                const lastSeg = id.split('_').pop();
-                if (lastSeg === 'info') return; // disabled info button
-                const page = parseInt(lastSeg.replace('p', ''));
-                if (isNaN(page) || page < 1) return;
-
-                // Determine type from second segment
-                const seg2 = id.split('_')[1];
-
                 if (seg2 === 'gu') {
                     const { embed, totalPages } = await buildGlobalUsersEmbed(page);
                     return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', page, totalPages)] });
@@ -709,12 +712,14 @@ client.on('interactionCreate', async interaction => {
                     return interaction.editReply({ embeds: [embed], components: [paginationRow('hs', '', page, totalPages)] });
                 }
                 if (seg2 === 'sv') {
-                    // lb_sv_{guildId}_p{N}  →  split: ['lb','sv',guildId,'pN']
                     const svGuildId = id.split('_')[2];
                     const { embed, totalPages } = await buildServerLbEmbed(svGuildId, page);
                     return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', svGuildId, page, totalPages)] });
                 }
-            } catch (e) { console.error('lb button:', e); return interaction.editReply({ content: '❌ Failed to load leaderboard.' }); }
+            } catch (e) {
+                console.error('lb button:', e);
+                await interaction.editReply({ content: '❌ Failed to load leaderboard. Try again in a moment.' }).catch(() => {});
+            }
         }
 
         return;
