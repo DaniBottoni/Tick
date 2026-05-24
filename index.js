@@ -14,9 +14,11 @@ const client = new Client({
 });
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// ── Pending saves (in-memory, keyed by prompt message ID) ────────────────────
-// { guildId, userId, prevCount, timeoutId }
+// Pending saves: keyed by prompt message ID
 const pendingSaves = new Map();
+
+const PAGE_SIZE    = 25;
+const SERVER_LB_MAX = 100; // max 4 pages for server leaderboard
 
 // ── DB ───────────────────────────────────────────────────────────────────────
 async function initDB() {
@@ -54,27 +56,18 @@ function saveState(guildId, data) {
 }
 
 function defaultState() {
-    return {
-        channelId: null,
-        current: 0,
-        lastUserId: null,
-        consecutiveCount: 0,
-        maxStreak: 1,
-        allowExpressions: true,
-        highScore: 0,
-        accessRoleId: null,
-    };
+    return { channelId: null, current: 0, lastUserId: null, consecutiveCount: 0,
+             maxStreak: 1, allowExpressions: true, highScore: 0, accessRoleId: null };
 }
 
-// ── Stats DB helpers ─────────────────────────────────────────────────────────
-// Returns the updated stats object
+// ── Stats DB ─────────────────────────────────────────────────────────────────
 async function updateUserStat(guildId, userId, delta) {
     try {
-        const res = await pool.query('SELECT data FROM user_stats WHERE guild_id = $1 AND user_id = $2', [guildId, userId]);
+        const res = await pool.query('SELECT data FROM user_stats WHERE guild_id=$1 AND user_id=$2', [guildId, userId]);
         const cur = res.rows[0]?.data ?? { correct: 0, ruined: 0, saves: 0, savesUsed: 0 };
         for (const [k, v] of Object.entries(delta)) cur[k] = (cur[k] || 0) + v;
         await pool.query(
-            'INSERT INTO user_stats (guild_id, user_id, data) VALUES ($1, $2, $3) ON CONFLICT (guild_id, user_id) DO UPDATE SET data = $3',
+            'INSERT INTO user_stats (guild_id,user_id,data) VALUES ($1,$2,$3) ON CONFLICT (guild_id,user_id) DO UPDATE SET data=$3',
             [guildId, userId, cur]
         );
         return cur;
@@ -82,68 +75,104 @@ async function updateUserStat(guildId, userId, delta) {
 }
 
 async function getUserStats(guildId, userId) {
-    const res = await pool.query('SELECT data FROM user_stats WHERE guild_id = $1 AND user_id = $2', [guildId, userId]);
+    const res = await pool.query('SELECT data FROM user_stats WHERE guild_id=$1 AND user_id=$2', [guildId, userId]);
     return res.rows[0]?.data ?? { correct: 0, ruined: 0, saves: 0, savesUsed: 0 };
 }
 
 async function getUserRank(guildId, userId) {
     const res = await pool.query(`
-        SELECT COUNT(*) + 1 AS rank FROM user_stats
-        WHERE guild_id = $1
-          AND COALESCE((data->>'correct')::int, 0) > COALESCE(
-              (SELECT (data->>'correct')::int FROM user_stats WHERE guild_id = $1 AND user_id = $2), 0
-          )
+        SELECT COUNT(*)+1 AS rank FROM user_stats
+        WHERE guild_id=$1
+          AND COALESCE((data->>'correct')::int,0) > COALESCE(
+              (SELECT (data->>'correct')::int FROM user_stats WHERE guild_id=$1 AND user_id=$2),0)
     `, [guildId, userId]);
     return parseInt(res.rows[0]?.rank ?? 1);
 }
 
-async function getServerLeaderboard(guildId) {
-    const res = await pool.query(`
-        SELECT user_id, data FROM user_stats
-        WHERE guild_id = $1
-        ORDER BY COALESCE((data->>'correct')::int, 0) DESC
-        LIMIT 10
-    `, [guildId]);
-    return res.rows;
-}
-
-async function getGlobalUserLeaderboard() {
-    const res = await pool.query(`
-        SELECT user_id,
-               SUM(COALESCE((data->>'correct')::int, 0)) AS correct,
-               SUM(COALESCE((data->>'ruined')::int,  0)) AS ruined
-        FROM user_stats
-        GROUP BY user_id
-        ORDER BY correct DESC
-        LIMIT 10
-    `);
-    return res.rows;
-}
-
-async function getGlobalServerLeaderboard() {
-    const res = await pool.query(`
-        SELECT guild_id,
-               COALESCE((data->>'highScore')::int, 0) AS high_score,
-               COALESCE((data->>'current')::int,   0) AS current_count
-        FROM counting
-        ORDER BY high_score DESC
-        LIMIT 10
-    `);
-    return res.rows;
-}
-
 async function getServerStats(guildId) {
     const res = await pool.query(`
-        SELECT
-            COUNT(*)                                            AS total_users,
-            SUM(COALESCE((data->>'correct')::int, 0))          AS total_correct,
-            SUM(COALESCE((data->>'ruined')::int,  0))          AS total_ruined
-        FROM user_stats WHERE guild_id = $1
+        SELECT COUNT(*) AS total_users,
+               SUM(COALESCE((data->>'correct')::int,0)) AS total_correct,
+               SUM(COALESCE((data->>'ruined')::int,0))  AS total_ruined
+        FROM user_stats WHERE guild_id=$1
     `, [guildId]);
     return res.rows[0] ?? {};
 }
 
-// ── Build embeds ─────────────────────────────────────────────────────────────
+// ── Paginated leaderboard queries ─────────────────────────────────────────────
+async function getServerLbPage(guildId, page) {
+    const cap    = SERVER_LB_MAX;
+    const offset = Math.min((page - 1) * PAGE_SIZE, cap - PAGE_SIZE);
+    const [rows, total] = await Promise.all([
+        pool.query(`
+            SELECT user_id, data FROM user_stats WHERE guild_id=$1
+            ORDER BY COALESCE((data->>'correct')::int,0) DESC
+            LIMIT $2 OFFSET $3
+        `, [guildId, PAGE_SIZE, offset]),
+        pool.query(`SELECT LEAST(COUNT(*), $2) AS cnt FROM user_stats WHERE guild_id=$1`, [guildId, cap]),
+    ]);
+    return { rows: rows.rows, total: parseInt(total.rows[0].cnt) };
+}
+
+async function getGlobalUsersPage(page) {
+    const offset = (page - 1) * PAGE_SIZE;
+    const [rows, total] = await Promise.all([
+        pool.query(`
+            SELECT user_id,
+                   SUM(COALESCE((data->>'correct')::int,0)) AS correct,
+                   SUM(COALESCE((data->>'ruined')::int,0))  AS ruined
+            FROM user_stats GROUP BY user_id
+            ORDER BY correct DESC
+            LIMIT $1 OFFSET $2
+        `, [PAGE_SIZE, offset]),
+        pool.query(`SELECT COUNT(DISTINCT user_id) AS cnt FROM user_stats`),
+    ]);
+    return { rows: rows.rows, total: parseInt(total.rows[0].cnt) };
+}
+
+async function getGlobalServersCurrentPage(page) {
+    // ranks by current score
+    const offset = (page - 1) * PAGE_SIZE;
+    const [rows, total] = await Promise.all([
+        pool.query(`
+            SELECT guild_id,
+                   COALESCE((data->>'current')::int,0)   AS current_count,
+                   COALESCE((data->>'highScore')::int,0)  AS high_score
+            FROM counting
+            ORDER BY current_count DESC
+            LIMIT $1 OFFSET $2
+        `, [PAGE_SIZE, offset]),
+        pool.query(`SELECT COUNT(*) AS cnt FROM counting`),
+    ]);
+    return { rows: rows.rows, total: parseInt(total.rows[0].cnt) };
+}
+
+async function getHighscoresPage(page) {
+    // ranks by all-time high score
+    const offset = (page - 1) * PAGE_SIZE;
+    const [rows, total] = await Promise.all([
+        pool.query(`
+            SELECT guild_id,
+                   COALESCE((data->>'highScore')::int,0)  AS high_score,
+                   COALESCE((data->>'current')::int,0)    AS current_count
+            FROM counting
+            ORDER BY high_score DESC
+            LIMIT $1 OFFSET $2
+        `, [PAGE_SIZE, offset]),
+        pool.query(`SELECT COUNT(*) AS cnt FROM counting`),
+    ]);
+    return { rows: rows.rows, total: parseInt(total.rows[0].cnt) };
+}
+
+// ── Guild name helper ────────────────────────────────────────────────────────
+async function guildName(id) {
+    try {
+        const g = client.guilds.cache.get(id) ?? await client.guilds.fetch(id).catch(() => null);
+        return g ? g.name : `Server ${id}`;
+    } catch { return `Server ${id}`; }
+}
+
+// ── Embed builders ────────────────────────────────────────────────────────────
 async function buildUserStatsEmbed(guildId, targetUser) {
     const [stats, rank, state] = await Promise.all([
         getUserStats(guildId, targetUser.id),
@@ -158,113 +187,154 @@ async function buildUserStatsEmbed(guildId, targetUser) {
         .setTitle(`📊 Stats — ${targetUser.username}`)
         .setThumbnail(targetUser.displayAvatarURL())
         .addFields(
-            { name: '✅ Correct counts',    value: `**${stats.correct ?? 0}**`,                           inline: true },
-            { name: '💥 Times ruined',      value: `**${stats.ruined  ?? 0}**`,                           inline: true },
-            { name: '🎯 Accuracy',          value: `**${accuracy}%**`,                                    inline: true },
-            { name: '🏅 Server rank',       value: `**#${rank}**`,                                        inline: true },
-            { name: '🔢 Current count',     value: `**${state.current}**`,                                inline: true },
-            { name: '🏆 Server high score', value: `**${state.highScore}**`,                              inline: true },
-            { name: '🛡️ Saves available',  value: `**${saves}**`,                                        inline: true },
-            { name: '⏳ Next save in',      value: saves > 0 ? `**${nextSave}** counts` : `**${nextSave}** counts`, inline: true },
-            { name: '🔖 Saves used',        value: `**${stats.savesUsed ?? 0}**`,                         inline: true },
+            { name: '✅ Correct counts',    value: `**${stats.correct ?? 0}**`, inline: true },
+            { name: '💥 Times ruined',      value: `**${stats.ruined  ?? 0}**`, inline: true },
+            { name: '🎯 Accuracy',          value: `**${accuracy}%**`,          inline: true },
+            { name: '🏅 Server rank',       value: `**#${rank}**`,              inline: true },
+            { name: '🔢 Current count',     value: `**${state.current}**`,      inline: true },
+            { name: '🏆 Server high score', value: `**${state.highScore}**`,    inline: true },
+            { name: '🛡️ Saves available',  value: `**${saves}**`,              inline: true },
+            { name: '⏳ Next save in',      value: `**${nextSave}** counts`,    inline: true },
+            { name: '🔖 Saves used',        value: `**${stats.savesUsed ?? 0}**`, inline: true },
         );
 }
 
 async function buildServerStatsEmbed(guild) {
-    const [serverStats, state] = await Promise.all([
-        getServerStats(guild.id),
-        getState(guild.id),
-    ]);
-    const totalCounts = parseInt(serverStats.total_correct) || 0;
-    const totalRuined = parseInt(serverStats.total_ruined)  || 0;
-    const totalUsers  = parseInt(serverStats.total_users)   || 0;
-    const grandTotal  = totalCounts + totalRuined;
-    const accuracy    = grandTotal > 0 ? Math.round((totalCounts / grandTotal) * 100) : 100;
+    const [ss, state] = await Promise.all([getServerStats(guild.id), getState(guild.id)]);
+    const tc = parseInt(ss.total_correct) || 0;
+    const tr = parseInt(ss.total_ruined)  || 0;
+    const tu = parseInt(ss.total_users)   || 0;
+    const gt = tc + tr;
+    const ac = gt > 0 ? Math.round((tc / gt) * 100) : 100;
     return new EmbedBuilder().setColor('#5865F2')
         .setTitle(`📊 Server Stats — ${guild.name}`)
         .setThumbnail(guild.iconURL())
         .addFields(
-            { name: '👥 Active counters', value: `**${totalUsers}**`,      inline: true },
-            { name: '✅ Total correct',   value: `**${totalCounts}**`,     inline: true },
-            { name: '💥 Total ruined',    value: `**${totalRuined}**`,     inline: true },
-            { name: '🎯 Server accuracy', value: `**${accuracy}%**`,       inline: true },
-            { name: '🔢 Current count',   value: `**${state.current}**`,   inline: true },
+            { name: '👥 Active counters', value: `**${tu}**`,           inline: true },
+            { name: '✅ Total correct',   value: `**${tc}**`,           inline: true },
+            { name: '💥 Total ruined',    value: `**${tr}**`,           inline: true },
+            { name: '🎯 Server accuracy', value: `**${ac}%**`,          inline: true },
+            { name: '🔢 Current count',   value: `**${state.current}**`, inline: true },
             { name: '🏆 All-time high',   value: `**${state.highScore}**`, inline: true },
         );
 }
 
-async function buildGlobalUsersEmbed() {
-    const rows   = await getGlobalUserLeaderboard();
-    const medals = ['🥇', '🥈', '🥉'];
-    if (!rows.length) return new EmbedBuilder().setColor('#5865F2').setTitle('🌍 Global Leaderboard — Users').setDescription('No stats yet!');
-    const lines = rows.map((r, i) =>
-        `${medals[i] ?? `**${i+1}.**`} <@${r.user_id}> — **${parseInt(r.correct)}** counts total`
-    );
-    return new EmbedBuilder().setColor('#5865F2')
-        .setTitle('🌍 Global Leaderboard — Users')
-        .setDescription(lines.join('\n'))
-        .setFooter({ text: `Top ${rows.length} counters across all servers` });
+async function buildServerLbEmbed(guildId, page) {
+    const { rows, total } = await getServerLbPage(guildId, page);
+    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const medals     = ['🥇', '🥈', '🥉'];
+    const offset     = (page - 1) * PAGE_SIZE;
+    if (!rows.length) return { embed: new EmbedBuilder().setColor('#5865F2').setTitle('🏆 Server Leaderboard').setDescription('No stats yet!'), totalPages: 1 };
+    const lines = rows.map((r, i) => {
+        const pos = offset + i + 1;
+        return `${medals[i + offset] ?? `**${pos}.**`} <@${r.user_id}> — **${r.data.correct ?? 0}** counts${r.data.ruined ? ` *(${r.data.ruined} ruined)*` : ''}`;
+    });
+    return {
+        embed: new EmbedBuilder().setColor('#5865F2').setTitle('🏆 Server Leaderboard')
+            .setDescription(lines.join('\n'))
+            .setFooter({ text: `Page ${page}/${totalPages} · Showing ${offset+1}–${offset+rows.length} of ${total} counters` }),
+        totalPages,
+    };
 }
 
-async function buildGlobalServersEmbed() {
-    const rows   = await getGlobalServerLeaderboard();
-    const medals = ['🥇', '🥈', '🥉'];
-    if (!rows.length) return new EmbedBuilder().setColor('#5865F2').setTitle('🌍 Global Leaderboard — Servers').setDescription('No stats yet!');
+async function buildGlobalUsersEmbed(page) {
+    const { rows, total } = await getGlobalUsersPage(page);
+    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const medals     = ['🥇', '🥈', '🥉'];
+    const offset     = (page - 1) * PAGE_SIZE;
+    if (!rows.length) return { embed: new EmbedBuilder().setColor('#5865F2').setTitle('🌍 Global — Users').setDescription('No stats yet!'), totalPages: 1 };
+    const lines = rows.map((r, i) => {
+        const pos = offset + i + 1;
+        return `${medals[i + offset] ?? `**${pos}.**`} <@${r.user_id}> — **${parseInt(r.correct)}** counts total`;
+    });
+    return {
+        embed: new EmbedBuilder().setColor('#5865F2').setTitle('🌍 Global Leaderboard — Users')
+            .setDescription(lines.join('\n'))
+            .setFooter({ text: `Page ${page}/${totalPages} · Showing ${offset+1}–${offset+rows.length} of ${total} users` }),
+        totalPages,
+    };
+}
+
+async function buildGlobalServersEmbed(page) {
+    const { rows, total } = await getGlobalServersCurrentPage(page);
+    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const medals     = ['🥇', '🥈', '🥉'];
+    const offset     = (page - 1) * PAGE_SIZE;
+    if (!rows.length) return { embed: new EmbedBuilder().setColor('#5865F2').setTitle('🌍 Global — Servers').setDescription('No stats yet!'), totalPages: 1 };
     const lines = await Promise.all(rows.map(async (r, i) => {
-        let name;
-        try {
-            const guild = client.guilds.cache.get(r.guild_id) ?? await client.guilds.fetch(r.guild_id).catch(() => null);
-            name = guild ? guild.name : `Server ${r.guild_id}`;
-        } catch { name = `Server ${r.guild_id}`; }
-        return `${medals[i] ?? `**${i+1}.**`} **${name}** — 🏆 High score **${r.high_score}** · Current **${r.current_count}**`;
+        const pos  = offset + i + 1;
+        const name = await guildName(r.guild_id);
+        return `${medals[i + offset] ?? `**${pos}.**`} **${name}** — 🔢 Current **${r.current_count}**`;
     }));
-    return new EmbedBuilder().setColor('#5865F2')
-        .setTitle('🌍 Global Leaderboard — Servers')
-        .setDescription(lines.join('\n'))
-        .setFooter({ text: `Top ${rows.length} servers by all-time high score` });
+    return {
+        embed: new EmbedBuilder().setColor('#5865F2').setTitle('🌍 Global Leaderboard — Servers (Current Score)')
+            .setDescription(lines.join('\n'))
+            .setFooter({ text: `Page ${page}/${totalPages} · Ranked by current count` }),
+        totalPages,
+    };
 }
 
-// ── Button row builders ──────────────────────────────────────────────────────
+async function buildHighscoresEmbed(page) {
+    const { rows, total } = await getHighscoresPage(page);
+    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const medals     = ['🥇', '🥈', '🥉'];
+    const offset     = (page - 1) * PAGE_SIZE;
+    if (!rows.length) return { embed: new EmbedBuilder().setColor('#5865F2').setTitle('🏅 High Score Leaderboard').setDescription('No data yet!'), totalPages: 1 };
+    const lines = await Promise.all(rows.map(async (r, i) => {
+        const pos  = offset + i + 1;
+        const name = await guildName(r.guild_id);
+        return `${medals[i + offset] ?? `**${pos}.**`} **${name}** — 🏆 Best **${r.high_score}** · Current **${r.current_count}**`;
+    }));
+    return {
+        embed: new EmbedBuilder().setColor('#5865F2').setTitle('🏅 All-Time High Score Leaderboard')
+            .setDescription(lines.join('\n'))
+            .setFooter({ text: `Page ${page}/${totalPages} · Ranked by all-time high score` }),
+        totalPages,
+    };
+}
+
+// ── Component row builders ────────────────────────────────────────────────────
 function statsRow(targetUserId, guildId, activePage) {
     return new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`stats_user_${targetUserId}_${guildId}`)
-            .setLabel('👤 User Stats')
+        new ButtonBuilder().setCustomId(`stats_user_${targetUserId}_${guildId}`).setLabel('👤 User Stats')
             .setStyle(activePage === 'user' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-        new ButtonBuilder()
-            .setCustomId(`stats_server_${targetUserId}_${guildId}`)
-            .setLabel('🏠 Server Stats')
+        new ButtonBuilder().setCustomId(`stats_server_${targetUserId}_${guildId}`).setLabel('🏠 Server Stats')
             .setStyle(activePage === 'server' ? ButtonStyle.Primary : ButtonStyle.Secondary),
     );
 }
 
-function globalLbRow(activePage) {
+// type: 'gu'=global users, 'gs'=global servers, 'hs'=highscores, 'sv'=server
+// ctx: guildId for 'sv', empty for others
+function paginationRow(type, ctx, page, totalPages) {
+    const base = ctx ? `lb_${type}_${ctx}` : `lb_${type}`;
     return new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId('glb_users')
-            .setLabel('👤 Users')
-            .setStyle(activePage === 'users' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-        new ButtonBuilder()
-            .setCustomId('glb_servers')
-            .setLabel('🏠 Servers')
-            .setStyle(activePage === 'servers' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`${base}_p${page - 1}`).setLabel('◀ Prev')
+            .setStyle(ButtonStyle.Secondary).setDisabled(page <= 1),
+        new ButtonBuilder().setCustomId(`${base}_info`).setLabel(`Page ${page} / ${totalPages}`)
+            .setStyle(ButtonStyle.Secondary).setDisabled(true),
+        new ButtonBuilder().setCustomId(`${base}_p${page + 1}`).setLabel('Next ▶')
+            .setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages),
+        new ButtonBuilder().setCustomId(`${base}_p${page}`).setLabel('🔄')
+            .setStyle(ButtonStyle.Secondary),
+    );
+}
+
+function globalTabRow(activeTab) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('lb_gu_p1').setLabel('👤 Users')
+            .setStyle(activeTab === 'gu' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('lb_gs_p1').setLabel('🏠 Servers')
+            .setStyle(activeTab === 'gs' ? ButtonStyle.Primary : ButtonStyle.Secondary),
     );
 }
 
 // ── Safe math evaluator ──────────────────────────────────────────────────────
-const CONSTANTS = {
-    phi:   (1 + Math.sqrt(5)) / 2,
-    pi:    Math.PI,
-    e:     Math.E,
-    tau:   Math.PI * 2,
-    sqrt2: Math.SQRT2,
-};
+const CONSTANTS = { phi: (1+Math.sqrt(5))/2, pi: Math.PI, e: Math.E, tau: Math.PI*2, sqrt2: Math.SQRT2 };
 
 function safeMath(expr) {
     let cleaned = expr.trim().toLowerCase().replace(/\s+/g, '');
     if (!cleaned) return null;
-    for (const [name, val] of Object.entries(CONSTANTS))
-        cleaned = cleaned.replaceAll(name, `(${val})`);
+    for (const [name, val] of Object.entries(CONSTANTS)) cleaned = cleaned.replaceAll(name, `(${val})`);
     if (!/^[\d.+\-*/^()]+$/.test(cleaned)) return null;
     const safe = cleaned.replace(/\^/g, '**');
     if (/\*\*\s*\d{4,}/.test(safe)) return null;
@@ -281,46 +351,30 @@ function generateExpressions(n) {
     const candidates = [];
     const phi = (1 + Math.sqrt(5)) / 2;
     const consts = [['phi', phi], ['pi', Math.PI], ['e', Math.E], ['sqrt2', Math.SQRT2], ['tau', Math.PI * 2]];
-
     for (let base = 2; base <= 50; base++)
         for (let exp = 2; exp <= 8; exp++)
             if (Math.pow(base, exp) === n) candidates.push(`${base}^${exp}`);
-
     for (const [name, val] of consts) {
         for (let exp = 1; exp <= 20; exp++)
             if (Math.round(Math.pow(val, exp)) === n) { candidates.push(`${name}^${exp}`); break; }
         for (let exp = 1; exp <= 10; exp++) {
-            const base = Math.round(Math.pow(val, exp));
-            const diff = n - base;
-            if (diff !== 0 && Math.abs(diff) <= 20)
-                candidates.push(`${name}^${exp}${diff > 0 ? '+' + diff : diff}`);
+            const base = Math.round(Math.pow(val, exp)), diff = n - base;
+            if (diff !== 0 && Math.abs(diff) <= 20) candidates.push(`${name}^${exp}${diff > 0 ? '+'+diff : diff}`);
         }
     }
-
     if (n > 4) for (let a = 2; a <= Math.sqrt(n); a++) if (n % a === 0) { candidates.push(`${a}*${n/a}`); break; }
-    if (n > 8) {
-        outer: for (let a = 2; a <= Math.cbrt(n); a++) if (n % a === 0) {
-            const rest = n / a;
-            for (let b = a; b <= Math.sqrt(rest); b++)
-                if (rest % b === 0) { candidates.push(`${a}*${b}*${rest/b}`); break outer; }
-        }
-    }
-    if (n > 2) { const a = Math.max(1, Math.floor(n * 0.35)); candidates.push(`${a}+${n-a}`); }
-    candidates.push(`${n + Math.round(n * 0.6) + 1}-${Math.round(n * 0.6) + 1}`);
-    candidates.push(`${n * (n <= 10 ? 2 : 3)}/${n <= 10 ? 2 : 3}`);
-    if (n > 5) for (let a = 2; a <= 10; a++) {
-        const base = Math.floor(n/a)*a, diff = n - base;
-        if (base > 0 && diff > 0 && diff < a) { candidates.push(`${a}*${Math.floor(n/a)}+${diff}`); break; }
-    }
-
-    const seen = new Set(), result = [];
-    for (const c of candidates.sort((a, b) => (/[a-z]/.test(b) ? 1 : 0) - (/[a-z]/.test(a) ? 1 : 0) || a.length - b.length))
-        if (!seen.has(c) && result.length < 3) { seen.add(c); result.push(c); }
-
-    if (result.length < 3) result.push(`${n-1}+1`);
-    if (result.length < 3) result.push(`${n*2}/2`);
-    if (result.length < 3) result.push(`${n+3}-3`);
-    return result.slice(0, 3);
+    if (n > 8) { outer: for (let a = 2; a <= Math.cbrt(n); a++) if (n % a === 0) { const rest=n/a; for (let b=a;b<=Math.sqrt(rest);b++) if (rest%b===0){candidates.push(`${a}*${b}*${rest/b}`);break outer;} } }
+    if (n > 2) { const a = Math.max(1, Math.floor(n*0.35)); candidates.push(`${a}+${n-a}`); }
+    candidates.push(`${n+Math.round(n*0.6)+1}-${Math.round(n*0.6)+1}`);
+    candidates.push(`${n*(n<=10?2:3)}/${n<=10?2:3}`);
+    if (n > 5) for (let a=2;a<=10;a++){const base=Math.floor(n/a)*a,diff=n-base;if(base>0&&diff>0&&diff<a){candidates.push(`${a}*${Math.floor(n/a)}+${diff}`);break;}}
+    const seen=new Set(),result=[];
+    for (const c of candidates.sort((a,b)=>(/[a-z]/.test(b)?1:0)-(/[a-z]/.test(a)?1:0)||a.length-b.length))
+        if(!seen.has(c)&&result.length<3){seen.add(c);result.push(c);}
+    if(result.length<3)result.push(`${n-1}+1`);
+    if(result.length<3)result.push(`${n*2}/2`);
+    if(result.length<3)result.push(`${n+3}-3`);
+    return result.slice(0,3);
 }
 
 // ── Help pages ───────────────────────────────────────────────────────────────
@@ -333,17 +387,15 @@ function buildHelpPage(page) {
                 { name: '✅ Correct count', value: 'React gets added, count goes up' },
                 { name: '❌ Wrong / too fast', value: 'Count resets — everyone starts over!' },
                 { name: '🏆 Milestones', value: 'The bot celebrates every 100 counts' },
-                { name: '🛡️ Saves', value: 'Earn 1 save every 50 correct counts. If you ruin the count, a save lets you undo it within 15 seconds!' }
+                { name: '🛡️ Saves', value: 'Earn 1 save every 50 correct counts. If you ruin the count, a save lets you undo it within 15 seconds!' },
             ).setFooter({ text: 'Page 1/4 • Counting Bot' }),
-
         new EmbedBuilder().setColor('#5865F2').setTitle('📋 Commands')
             .setDescription('All available commands:')
             .addFields(
                 { name: '🔢 Counting', value: '`/counting channel` — set the counting channel\n`/counting status` — view current count & settings\n`/counting reset` — reset the count *(requires permission)*' },
-                { name: '📊 Stats & Leaderboards', value: '`/stats [user]` — view stats with user/server tabs\n`/leaderboard server` — top counters in this server\n`/leaderboard global` — global users & servers tabs' },
-                { name: '🛠️ Utilities', value: '`/calculate <number>` — get 3 expressions for any number\n`/invite` — get the bot invite link\n`/help` — this menu' }
+                { name: '📊 Stats & Leaderboards', value: '`/stats [user]` — view stats with user/server tabs\n`/leaderboard server` — paginated server leaderboard (100 users)\n`/leaderboard global` — global users & servers, 25/page\n`/leaderboard highscores` — servers ranked by all-time high score' },
+                { name: '🛠️ Utilities', value: '`/calculate <number>` — get 3 expressions for any number\n`/invite` — get the bot invite link\n`/help` — this menu' },
             ).setFooter({ text: 'Page 2/4 • Counting Bot' }),
-
         new EmbedBuilder().setColor('#5865F2').setTitle('⚙️ Config & Admin')
             .setDescription('Admin & configuration commands. Requires **Administrator** or the configured access role.')
             .addFields(
@@ -351,30 +403,27 @@ function buildHelpPage(page) {
                 { name: '⚙️ /config expressions <bool>', value: 'Allow or block math expressions. Default: **enabled**' },
                 { name: '🔒 /config access', value: 'Pick a role that can use config commands. Admins always have access.' },
                 { name: '📍 /counting channel', value: 'Set or change the counting channel.' },
-                { name: '🔄 /counting reset', value: 'Manually reset the count back to 0.' }
+                { name: '🔄 /counting reset', value: 'Manually reset the count back to 0.' },
             ).setFooter({ text: 'Page 3/4 • Counting Bot' }),
-
         new EmbedBuilder().setColor('#5865F2').setTitle('🧮 Expressions')
             .setDescription('When expressions are enabled, you can type math instead of plain numbers. The result is **rounded** to the nearest whole number.')
             .addFields(
                 { name: '➕ Operators', value: '`+` add  •  `-` subtract  •  `*` multiply  •  `/` divide  •  `^` power' },
                 { name: '📐 Constants', value: '`pi` ≈ 3.14159\n`phi` ≈ 1.61803 *(golden ratio)*\n`e` ≈ 2.71828\n`tau` ≈ 6.28318\n`sqrt2` ≈ 1.41421' },
                 { name: '💡 Examples', value: '`2+2` → **4**\n`pi^2` → **10**\n`phi^10` → **11**\n`phi+phi^pi+pi` → **9**\n`2^8` → **256**' },
-                { name: '🧮 /calculate', value: 'Use `/calculate <number>` to get 3 ready-made expressions for any number!' }
+                { name: '🧮 /calculate', value: 'Use `/calculate <number>` to get 3 ready-made expressions for any number!' },
             ).setFooter({ text: 'Page 4/4 • Counting Bot' }),
     ];
-
     const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('help_1').setLabel('How to Play').setStyle(page === 1 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('help_2').setLabel('Commands').setStyle(page === 2 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('help_3').setLabel('Config').setStyle(page === 3 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('help_4').setLabel('Expressions').setStyle(page === 4 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('help_1').setLabel('How to Play').setStyle(page===1?ButtonStyle.Primary:ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('help_2').setLabel('Commands').setStyle(page===2?ButtonStyle.Primary:ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('help_3').setLabel('Config').setStyle(page===3?ButtonStyle.Primary:ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('help_4').setLabel('Expressions').setStyle(page===4?ButtonStyle.Primary:ButtonStyle.Secondary),
     );
-
-    return { embeds: [embeds[page - 1]], components: [row] };
+    return { embeds: [embeds[page-1]], components: [row] };
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Misc helpers ──────────────────────────────────────────────────────────────
 function E(color, title) { return new EmbedBuilder().setColor(color).setTitle(title); }
 
 async function hasPermission(interaction, guildId) {
@@ -383,71 +432,55 @@ async function hasPermission(interaction, guildId) {
     return state.accessRoleId ? interaction.member.roles.cache.has(state.accessRoleId) : false;
 }
 
-// ── Save prompt helpers ───────────────────────────────────────────────────────
+// ── Save helpers ─────────────────────────────────────────────────────────────
 async function triggerRuin(channel, guildId, state, userId, reason) {
-    const prev = state.current;
+    const prev  = state.current;
     const stats = await getUserStats(guildId, userId);
     const hasSave = (stats.saves ?? 0) > 0;
 
     if (hasSave) {
-        // Don't reset yet — give the user 15s to use their save
         const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(`saveuse_${userId}`)
-                .setLabel(`🛡️ Use Save (${stats.saves} left)`)
-                .setStyle(ButtonStyle.Success),
-            new ButtonBuilder()
-                .setCustomId(`savedecline_${userId}`)
-                .setLabel('❌ Let it reset')
-                .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(`saveuse_${userId}`).setLabel(`🛡️ Use Save (${stats.saves} left)`).setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`savedecline_${userId}`).setLabel('❌ Let it reset').setStyle(ButtonStyle.Danger),
         );
-
         const prompt = await channel.send({
             embeds: [E('#ff9900', '⚠️ Count almost ruined!')
                 .setDescription(`<@${userId}> made a mistake! (${reason})\n\n<@${userId}>, you have a **🛡️ Save** — use it within **15 seconds** to keep the count at **${prev}**!`)
-                .addFields({ name: '🛡️ Saves available', value: `**${stats.saves}**`, inline: true }, { name: '🔢 Count at risk', value: `**${prev}**`, inline: true })
-            ],
+                .addFields(
+                    { name: '🛡️ Saves available', value: `**${stats.saves}**`, inline: true },
+                    { name: '🔢 Count at risk',    value: `**${prev}**`,        inline: true },
+                )],
             components: [row],
         }).catch(() => null);
 
-        if (!prompt) {
-            // Message failed — just reset
-            doReset(channel, guildId, state, userId, prev);
-            return;
-        }
+        if (!prompt) { doReset(channel, guildId, state, userId); return; }
 
         const timeoutId = setTimeout(async () => {
             if (!pendingSaves.has(prompt.id)) return;
             pendingSaves.delete(prompt.id);
-            doReset(channel, guildId, state, userId, prev);
+            doReset(channel, guildId, state, userId);
             await prompt.edit({
                 embeds: [E('#ff4444', '💥 Save expired — count ruined!')
-                    .setDescription(`<@${userId}> didn't use their save in time!\nThe count resets from **${prev}** back to **1**.`)
-                    .addFields({ name: '🏆 High Score', value: `**${state.highScore}**`, inline: true })
-                ],
+                    .setDescription(`<@${userId}> didn't use their save in time! The count resets from **${prev}** back to **1**.`)
+                    .addFields({ name: '🏆 High Score', value: `**${state.highScore}**`, inline: true })],
                 components: [],
             }).catch(() => {});
         }, 15_000);
 
         pendingSaves.set(prompt.id, { guildId, userId, prevCount: prev, timeoutId, state: { ...state } });
-
     } else {
-        // No save — reset immediately
-        doReset(channel, guildId, state, userId, prev);
+        doReset(channel, guildId, state, userId);
         await channel.send({
             embeds: [E('#ff4444', '💥 Count ruined!')
                 .setDescription(`<@${userId}> ruined the count! (${reason})\nThe count was at **${prev}**.`)
                 .addFields({ name: '🔄 Reset to', value: '**1**', inline: true }, { name: '🏆 High Score', value: `**${state.highScore}**`, inline: true })
-                .setFooter({ text: 'Start again from 1!' })
-            ]
+                .setFooter({ text: 'Start again from 1!' })],
         }).catch(() => {});
     }
 }
 
-function doReset(channel, guildId, state, userId, prev) {
-    state.current = 0;
-    state.lastUserId = null;
-    state.consecutiveCount = 0;
+function doReset(channel, guildId, state, userId) {
+    state.current = 0; state.lastUserId = null; state.consecutiveCount = 0;
     saveState(guildId, state);
     updateUserStat(guildId, userId, { ruined: 1 });
 }
@@ -455,12 +488,12 @@ function doReset(channel, guildId, state, userId, prev) {
 // ── Keep-alive ───────────────────────────────────────────────────────────────
 function keepAlive() {
     const ping = () => {
-        const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
+        const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT||3000}`;
         const mod = url.startsWith('https') ? require('https') : http;
         mod.get(url, () => {}).on('error', () => {});
     };
     setTimeout(ping, 5000);
-    setInterval(ping, 14 * 60 * 1000);
+    setInterval(ping, 14*60*1000);
 }
 
 // ── Ready ────────────────────────────────────────────────────────────────────
@@ -477,14 +510,15 @@ client.once('ready', async () => {
 
         new SlashCommandBuilder().setName('config').setDescription('Configure bot settings')
             .addSubcommand(s => s.setName('maxstreak').setDescription('How many counts one person can do in a row (default: 1)')
-                .addIntegerOption(o => o.setName('amount').setDescription('Max consecutive counts per user (1–20)').setRequired(true).setMinValue(1).setMaxValue(20)))
+                .addIntegerOption(o => o.setName('amount').setDescription('Max consecutive counts (1–20)').setRequired(true).setMinValue(1).setMaxValue(20)))
             .addSubcommand(s => s.setName('expressions').setDescription('Allow or disallow math expressions like 1+1')
                 .addBooleanOption(o => o.setName('enabled').setDescription('Enable or disable expressions').setRequired(true)))
-            .addSubcommand(s => s.setName('access').setDescription('Set which role can use config commands (admins always have access)')),
+            .addSubcommand(s => s.setName('access').setDescription('Set which role can use config commands')),
 
         new SlashCommandBuilder().setName('leaderboard').setDescription('View counting leaderboards')
-            .addSubcommand(s => s.setName('server').setDescription('Top counters in this server'))
-            .addSubcommand(s => s.setName('global').setDescription('Top counters and servers globally')),
+            .addSubcommand(s => s.setName('server').setDescription('Top counters in this server (up to 100, paginated)'))
+            .addSubcommand(s => s.setName('global').setDescription('Global leaderboard — users & servers, 25 per page'))
+            .addSubcommand(s => s.setName('highscores').setDescription('Servers ranked by all-time high score, 25 per page')),
 
         new SlashCommandBuilder().setName('stats').setDescription('View counting stats')
             .addUserOption(o => o.setName('user').setDescription('User to check (defaults to yourself)')),
@@ -513,21 +547,20 @@ client.once('ready', async () => {
 client.on('messageCreate', async message => {
     if (message.author.bot || !message.guild) return;
     const guildId = message.guild.id;
-    const state = await getState(guildId).catch(() => null);
+    const state   = await getState(guildId).catch(() => null);
     if (!state?.channelId || message.channel.id !== state.channelId) return;
 
-    // Block new counts while a save prompt is active for this guild
+    // Block new counts while a save prompt is pending for this guild
     if ([...pendingSaves.values()].some(p => p.guildId === guildId)) return;
 
-    const raw = message.content.trim();
+    const raw      = message.content.trim();
     const hasConst = Object.keys(CONSTANTS).some(c => raw.toLowerCase().includes(c));
-    const isExpression = (/[+\-*/^()]/.test(raw) && !/^\-?\d+$/.test(raw)) || hasConst;
+    const isExpr   = (/[+\-*/^()]/.test(raw) && !/^\-?\d+$/.test(raw)) || hasConst;
 
-    if (isExpression && !state.allowExpressions) {
+    if (isExpr && !state.allowExpressions) {
         await message.react('❌').catch(() => {});
         const sent = await message.channel.send({
-            embeds: [E('#ff4444', '❌ Expressions disabled')
-                .setDescription(`Expressions like \`${raw}\` are not allowed here. Just type the plain number!`)]
+            embeds: [E('#ff4444', '❌ Expressions disabled').setDescription(`Expressions like \`${raw}\` are not allowed here. Just type the plain number!`)]
         }).catch(() => null);
         if (sent) setTimeout(() => sent.delete().catch(() => {}), 5000);
         return;
@@ -538,23 +571,18 @@ client.on('messageCreate', async message => {
 
     const expected = state.current + 1;
 
-    // ── Wrong number ─────────────────────────────────────────────────────────
     if (value !== expected) {
         await message.react('❌').catch(() => {});
-        await triggerRuin(message.channel, guildId, state, message.author.id,
-            `sent \`${value}\` but expected \`${expected}\``);
+        await triggerRuin(message.channel, guildId, state, message.author.id, `sent \`${value}\` but expected \`${expected}\``);
         return;
     }
 
-    // ── Consecutive count violation ───────────────────────────────────────────
     if (state.maxStreak > 0 && message.author.id === state.lastUserId && state.consecutiveCount >= state.maxStreak) {
         await message.react('❌').catch(() => {});
-        await triggerRuin(message.channel, guildId, state, message.author.id,
-            `counted more than **${state.maxStreak}** time(s) in a row`);
+        await triggerRuin(message.channel, guildId, state, message.author.id, `counted more than **${state.maxStreak}** time(s) in a row`);
         return;
     }
 
-    // ── Correct count ─────────────────────────────────────────────────────────
     const isSameUser = message.author.id === state.lastUserId;
     state.current = value;
     state.lastUserId = message.author.id;
@@ -562,14 +590,12 @@ client.on('messageCreate', async message => {
     if (value > state.highScore) state.highScore = value;
     saveState(guildId, state);
 
-    // Update stats and check for save milestone
     const newStats = await updateUserStat(guildId, message.author.id, { correct: 1 });
     if (newStats && newStats.correct > 0 && newStats.correct % 50 === 0) {
         await updateUserStat(guildId, message.author.id, { saves: 1 });
         await message.channel.send({
             embeds: [E('#ffd700', '🛡️ Save earned!')
-                .setDescription(`<@${message.author.id}> earned a **Save** for reaching **${newStats.correct}** correct counts!\nYou now have **${(newStats.saves ?? 0) + 1}** save(s). Use it if you ever ruin the count!`)
-            ]
+                .setDescription(`<@${message.author.id}> earned a **Save** for reaching **${newStats.correct}** correct counts!\nYou now have **${(newStats.saves ?? 0) + 1}** save(s). Use it if you ever ruin the count!`)]
         }).catch(() => {});
     }
 
@@ -592,128 +618,118 @@ client.on('interactionCreate', async interaction => {
     // ── Buttons ───────────────────────────────────────────────────────────────
     if (interaction.isButton()) {
 
-        // Help page navigation
+        // Help navigation
         if (interaction.customId.startsWith('help_')) {
             const page = parseInt(interaction.customId.split('_')[1]);
-            if (!isNaN(page) && page >= 1 && page <= 4)
-                return interaction.update(buildHelpPage(page));
+            if (!isNaN(page) && page >= 1 && page <= 4) return interaction.update(buildHelpPage(page));
         }
 
-        // Save prompt: use save
+        // Save: use
         if (interaction.customId.startsWith('saveuse_')) {
             const ownerId = interaction.customId.split('_')[1];
             if (interaction.user.id !== ownerId)
                 return interaction.reply({ content: '❌ Only the person who ruined the count can use their save!', flags: [MessageFlags.Ephemeral] });
-
             const pending = pendingSaves.get(interaction.message.id);
             if (!pending) return interaction.reply({ content: '❌ This save prompt has already expired.', flags: [MessageFlags.Ephemeral] });
-
             clearTimeout(pending.timeoutId);
             pendingSaves.delete(interaction.message.id);
-
-            // Restore the state
             const state = await getState(pending.guildId);
-            state.current = pending.prevCount;
-            state.lastUserId = ownerId;      // ruiner becomes last counter so they can't immediately count again
-            state.consecutiveCount = 1;
+            state.current = pending.prevCount; state.lastUserId = ownerId; state.consecutiveCount = 1;
             saveState(pending.guildId, state);
-
-            // Deduct save, increment savesUsed
             await updateUserStat(pending.guildId, ownerId, { saves: -1, savesUsed: 1 });
             const updated = await getUserStats(pending.guildId, ownerId);
-
-            await interaction.update({
+            return interaction.update({
                 embeds: [E('#00cc88', '🛡️ Save used!')
                     .setDescription(`<@${ownerId}> used a **Save** — the count stays at **${pending.prevCount}**!`)
-                    .addFields(
-                        { name: '🛡️ Saves remaining', value: `**${updated.saves ?? 0}**`, inline: true },
-                        { name: '🔢 Count continues at', value: `**${pending.prevCount}**`, inline: true }
-                    )
-                ],
+                    .addFields({ name: '🛡️ Saves remaining', value: `**${updated.saves ?? 0}**`, inline: true }, { name: '🔢 Count continues at', value: `**${pending.prevCount}**`, inline: true })],
                 components: [],
-            }).catch(() => {});
-            return;
+            });
         }
 
-        // Save prompt: decline
+        // Save: decline
         if (interaction.customId.startsWith('savedecline_')) {
             const ownerId = interaction.customId.split('_')[1];
             if (interaction.user.id !== ownerId)
                 return interaction.reply({ content: '❌ Only the person who ruined the count can decline.', flags: [MessageFlags.Ephemeral] });
-
             const pending = pendingSaves.get(interaction.message.id);
             if (!pending) return interaction.reply({ content: '❌ This save prompt has already expired.', flags: [MessageFlags.Ephemeral] });
-
             clearTimeout(pending.timeoutId);
             pendingSaves.delete(interaction.message.id);
-
-            doReset(null, pending.guildId, pending.state, ownerId, pending.prevCount);
-
-            await interaction.update({
+            doReset(null, pending.guildId, pending.state, ownerId);
+            return interaction.update({
                 embeds: [E('#ff4444', '💥 Count ruined!')
                     .setDescription(`<@${ownerId}> chose not to use their save. The count resets from **${pending.prevCount}** back to **1**.`)
-                    .addFields({ name: '🏆 High Score', value: `**${pending.state.highScore}**`, inline: true })
-                ],
+                    .addFields({ name: '🏆 High Score', value: `**${pending.state.highScore}**`, inline: true })],
                 components: [],
-            }).catch(() => {});
-            return;
+            });
         }
 
-        // Stats tab switching
+        // Stats tabs
         if (interaction.customId.startsWith('stats_')) {
             await interaction.deferUpdate();
-            const parts        = interaction.customId.split('_');
-            const view         = parts[1];
-            const targetUserId = parts[2];
-            const btnGuildId   = parts[3];
+            const parts = interaction.customId.split('_');
+            const view = parts[1], tuid = parts[2], bgid = parts[3];
             try {
                 if (view === 'user') {
-                    const targetUser = await client.users.fetch(targetUserId).catch(() => interaction.user);
-                    const embed = await buildUserStatsEmbed(btnGuildId, targetUser);
-                    return interaction.editReply({ embeds: [embed], components: [statsRow(targetUserId, btnGuildId, 'user')] });
+                    const u = await client.users.fetch(tuid).catch(() => interaction.user);
+                    return interaction.editReply({ embeds: [await buildUserStatsEmbed(bgid, u)], components: [statsRow(tuid, bgid, 'user')] });
                 }
                 if (view === 'server') {
-                    const guild = client.guilds.cache.get(btnGuildId) ?? await client.guilds.fetch(btnGuildId).catch(() => interaction.guild);
-                    const embed = await buildServerStatsEmbed(guild);
-                    return interaction.editReply({ embeds: [embed], components: [statsRow(targetUserId, btnGuildId, 'server')] });
+                    const g = client.guilds.cache.get(bgid) ?? await client.guilds.fetch(bgid).catch(() => interaction.guild);
+                    return interaction.editReply({ embeds: [await buildServerStatsEmbed(g)], components: [statsRow(tuid, bgid, 'server')] });
                 }
-            } catch (e) {
-                console.error('stats button error:', e);
-                return interaction.editReply({ content: '❌ Failed to load stats.' });
-            }
+            } catch (e) { console.error('stats button:', e); return interaction.editReply({ content: '❌ Failed to load stats.' }); }
         }
 
-        // Global leaderboard tab switching
-        if (interaction.customId === 'glb_users' || interaction.customId === 'glb_servers') {
+        // Leaderboard pagination — customId format: lb_{type}[_{ctx}]_p{N} or lb_{type}[_{ctx}]_info
+        if (interaction.customId.startsWith('lb_')) {
             await interaction.deferUpdate();
             try {
-                if (interaction.customId === 'glb_users') {
-                    const embed = await buildGlobalUsersEmbed();
-                    return interaction.editReply({ embeds: [embed], components: [globalLbRow('users')] });
+                const id = interaction.customId; // e.g. lb_gu_p2, lb_sv_123456_p3, lb_hs_p1
+
+                // Parse page number from the last segment
+                const lastSeg = id.split('_').pop();
+                if (lastSeg === 'info') return; // disabled info button
+                const page = parseInt(lastSeg.replace('p', ''));
+                if (isNaN(page) || page < 1) return;
+
+                // Determine type from second segment
+                const seg2 = id.split('_')[1];
+
+                if (seg2 === 'gu') {
+                    const { embed, totalPages } = await buildGlobalUsersEmbed(page);
+                    return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', page, totalPages)] });
                 }
-                if (interaction.customId === 'glb_servers') {
-                    const embed = await buildGlobalServersEmbed();
-                    return interaction.editReply({ embeds: [embed], components: [globalLbRow('servers')] });
+                if (seg2 === 'gs') {
+                    const { embed, totalPages } = await buildGlobalServersEmbed(page);
+                    return interaction.editReply({ embeds: [embed], components: [globalTabRow('gs'), paginationRow('gs', '', page, totalPages)] });
                 }
-            } catch (e) {
-                console.error('global lb button error:', e);
-                return interaction.editReply({ content: '❌ Failed to load leaderboard.' });
-            }
+                if (seg2 === 'hs') {
+                    const { embed, totalPages } = await buildHighscoresEmbed(page);
+                    return interaction.editReply({ embeds: [embed], components: [paginationRow('hs', '', page, totalPages)] });
+                }
+                if (seg2 === 'sv') {
+                    // lb_sv_{guildId}_p{N}  →  split: ['lb','sv',guildId,'pN']
+                    const svGuildId = id.split('_')[2];
+                    const { embed, totalPages } = await buildServerLbEmbed(svGuildId, page);
+                    return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', svGuildId, page, totalPages)] });
+                }
+            } catch (e) { console.error('lb button:', e); return interaction.editReply({ content: '❌ Failed to load leaderboard.' }); }
         }
 
         return;
     }
 
-    // ── Role select: config access ────────────────────────────────────────────
+    // ── Role select ───────────────────────────────────────────────────────────
     if (interaction.isRoleSelectMenu()) {
         if (!interaction.customId.startsWith('access_role_')) return;
         const roleId = interaction.values[0];
-        const state = await getState(guildId);
+        const state  = await getState(guildId);
         state.accessRoleId = roleId;
         saveState(guildId, state);
         return interaction.update({
             embeds: [E('#5865F2', '✅ Access role updated').setDescription(`<@&${roleId}> can now use config commands.`)],
-            components: []
+            components: [],
         });
     }
 
@@ -724,11 +740,9 @@ client.on('interactionCreate', async interaction => {
 
     try {
 
-        // ── /help ─────────────────────────────────────────────────────────────
         if (commandName === 'help')
             return interaction.reply({ ...buildHelpPage(1), flags: [MessageFlags.Ephemeral] });
 
-        // ── /invite ───────────────────────────────────────────────────────────
         if (commandName === 'invite') {
             const url = `https://discord.com/oauth2/authorize?client_id=${client.user.id}&permissions=76864&scope=bot%20applications.commands`;
             return interaction.reply({
@@ -736,11 +750,10 @@ client.on('interactionCreate', async interaction => {
                     .setDescription(`[**Click here to invite me to your server!**](${url})`)
                     .addFields({ name: '🔐 Permissions requested', value: '• View Channels\n• Send Messages\n• Add Reactions\n• Read Message History\n• Manage Messages' })
                     .setFooter({ text: 'After inviting, use /counting channel to set up!' })],
-                flags: [MessageFlags.Ephemeral]
+                flags: [MessageFlags.Ephemeral],
             });
         }
 
-        // ── /calculate ────────────────────────────────────────────────────────
         if (commandName === 'calculate') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             const n = options.getInteger('number');
@@ -753,47 +766,39 @@ client.on('interactionCreate', async interaction => {
                         value: `= **${safeMath(expr) ?? n}**`,
                         inline: true,
                     })))
-                    .setFooter({ text: 'Supports: + - * / ^ pi phi e tau sqrt2' })]
+                    .setFooter({ text: 'Supports: + - * / ^ pi phi e tau sqrt2' })],
             });
         }
 
-        // ── /stats ────────────────────────────────────────────────────────────
         if (commandName === 'stats') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             const targetUser = options.getUser('user') ?? interaction.user;
-            const embed = await buildUserStatsEmbed(guildId, targetUser);
             return interaction.editReply({
-                embeds: [embed],
+                embeds: [await buildUserStatsEmbed(guildId, targetUser)],
                 components: [statsRow(targetUser.id, guildId, 'user')],
             });
         }
 
-        // ── /leaderboard ──────────────────────────────────────────────────────
         if (commandName === 'leaderboard') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const sub    = options.getSubcommand();
-            const medals = ['🥇', '🥈', '🥉'];
+            const sub = options.getSubcommand();
 
             if (sub === 'server') {
-                const rows = await getServerLeaderboard(guildId);
-                if (!rows.length) return interaction.editReply({ content: '📊 No stats yet — start counting!' });
-                const lines = rows.map((r, i) =>
-                    `${medals[i] ?? `**${i+1}.**`} <@${r.user_id}> — **${r.data.correct ?? 0}** counts${r.data.ruined ? ` *(${r.data.ruined} ruined)*` : ''}`
-                );
-                return interaction.editReply({
-                    embeds: [E('#5865F2', '🏆 Server Leaderboard')
-                        .setDescription(lines.join('\n'))
-                        .setFooter({ text: `Top ${rows.length} counters in this server` })]
-                });
+                const { embed, totalPages } = await buildServerLbEmbed(guildId, 1);
+                return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', guildId, 1, totalPages)] });
             }
 
             if (sub === 'global') {
-                const embed = await buildGlobalUsersEmbed();
-                return interaction.editReply({ embeds: [embed], components: [globalLbRow('users')] });
+                const { embed, totalPages } = await buildGlobalUsersEmbed(1);
+                return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, totalPages)] });
+            }
+
+            if (sub === 'highscores') {
+                const { embed, totalPages } = await buildHighscoresEmbed(1);
+                return interaction.editReply({ embeds: [embed], components: [paginationRow('hs', '', 1, totalPages)] });
             }
         }
 
-        // ── /config ───────────────────────────────────────────────────────────
         if (commandName === 'config') {
             const sub = options.getSubcommand();
 
@@ -803,15 +808,13 @@ client.on('interactionCreate', async interaction => {
                 const state = await getState(guildId);
                 return interaction.reply({
                     embeds: [E('#5865F2', '🔒 Access Configuration')
-                        .setDescription('Select which role can use `/config` commands.\n\n**Note:** Server administrators always have access regardless.')
+                        .setDescription('Select which role can use `/config` commands.\n\n**Note:** Administrators always have access regardless.')
                         .addFields({ name: 'Current access role', value: state.accessRoleId ? `<@&${state.accessRoleId}>` : 'None *(admins only)*' })],
                     components: [new ActionRowBuilder().addComponents(
-                        new RoleSelectMenuBuilder()
-                            .setCustomId(`access_role_${guildId}`)
-                            .setPlaceholder('Select a role for config access')
-                            .setMinValues(1).setMaxValues(1)
+                        new RoleSelectMenuBuilder().setCustomId(`access_role_${guildId}`)
+                            .setPlaceholder('Select a role for config access').setMinValues(1).setMaxValues(1)
                     )],
-                    flags: [MessageFlags.Ephemeral]
+                    flags: [MessageFlags.Ephemeral],
                 });
             }
 
@@ -823,30 +826,24 @@ client.on('interactionCreate', async interaction => {
 
             if (sub === 'maxstreak') {
                 const amount = options.getInteger('amount');
-                state.maxStreak = amount;
-                saveState(guildId, state);
+                state.maxStreak = amount; saveState(guildId, state);
                 return interaction.editReply({
-                    embeds: [E('#5865F2', '✅ Max streak updated')
-                        .setDescription(amount === 1
-                            ? 'Users can no longer count twice in a row.'
-                            : `Users can now count **${amount}** times in a row before someone else must count.`)]
+                    embeds: [E('#5865F2', '✅ Max streak updated').setDescription(amount === 1
+                        ? 'Users can no longer count twice in a row.'
+                        : `Users can now count **${amount}** times in a row before someone else must count.`)]
                 });
             }
-
             if (sub === 'expressions') {
                 const enabled = options.getBoolean('enabled');
-                state.allowExpressions = enabled;
-                saveState(guildId, state);
+                state.allowExpressions = enabled; saveState(guildId, state);
                 return interaction.editReply({
-                    embeds: [E('#5865F2', `✅ Expressions ${enabled ? 'enabled' : 'disabled'}`)
-                        .setDescription(enabled
-                            ? 'Users can now count with expressions like `1+1`, `3*4`, `2^3`, etc.'
-                            : 'Only plain numbers are now accepted in the counting channel.')]
+                    embeds: [E('#5865F2', `✅ Expressions ${enabled ? 'enabled' : 'disabled'}`).setDescription(enabled
+                        ? 'Users can now count with expressions like `1+1`, `3*4`, `2^3`, etc.'
+                        : 'Only plain numbers are now accepted in the counting channel.')]
                 });
             }
         }
 
-        // ── /counting ─────────────────────────────────────────────────────────
         if (commandName === 'counting') {
             const sub = options.getSubcommand();
 
@@ -855,12 +852,12 @@ client.on('interactionCreate', async interaction => {
                 const state = await getState(guildId);
                 return interaction.editReply({
                     embeds: [E('#5865F2', '📊 Counting Status').addFields(
-                        { name: '📍 Channel',       value: state.channelId ? `<#${state.channelId}>` : 'Not set', inline: true },
-                        { name: '🔢 Current count', value: `**${state.current}**`,                                inline: true },
-                        { name: '🏆 High score',    value: `**${state.highScore}**`,                              inline: true },
-                        { name: '🔁 Max streak',    value: `**${state.maxStreak}** in a row`,                     inline: true },
-                        { name: '🧮 Expressions',   value: state.allowExpressions ? '✅ Allowed' : '❌ Disabled', inline: true },
-                        { name: '👤 Last counter',  value: state.lastUserId ? `<@${state.lastUserId}>` : 'Nobody yet', inline: true },
+                        { name: '📍 Channel',       value: state.channelId ? `<#${state.channelId}>` : 'Not set',           inline: true },
+                        { name: '🔢 Current count', value: `**${state.current}**`,                                           inline: true },
+                        { name: '🏆 High score',    value: `**${state.highScore}**`,                                         inline: true },
+                        { name: '🔁 Max streak',    value: `**${state.maxStreak}** in a row`,                                inline: true },
+                        { name: '🧮 Expressions',   value: state.allowExpressions ? '✅ Allowed' : '❌ Disabled',            inline: true },
+                        { name: '👤 Last counter',  value: state.lastUserId ? `<@${state.lastUserId}>` : 'Nobody yet',       inline: true },
                     )]
                 });
             }
@@ -874,24 +871,18 @@ client.on('interactionCreate', async interaction => {
             if (sub === 'channel') {
                 const ch = options.getChannel('channel');
                 if (!ch.isTextBased()) return interaction.editReply({ content: '❌ Please select a text channel.' });
-                state.channelId = ch.id;
-                saveState(guildId, state);
+                state.channelId = ch.id; saveState(guildId, state);
                 return interaction.editReply({
-                    embeds: [E('#5865F2', '✅ Counting channel set')
-                        .setDescription(`The counting channel has been set to ${ch}.\nStart counting from **1**!`)]
+                    embeds: [E('#5865F2', '✅ Counting channel set').setDescription(`The counting channel has been set to ${ch}.\nStart counting from **1**!`)]
                 });
             }
-
             if (sub === 'reset') {
                 const prev = state.current;
                 state.current = 0; state.lastUserId = null; state.consecutiveCount = 0;
                 saveState(guildId, state);
                 if (state.channelId) {
                     const ch = interaction.guild.channels.cache.get(state.channelId);
-                    if (ch) ch.send({
-                        embeds: [E('#ff9900', '🔄 Count manually reset')
-                            .setDescription(`An admin reset the count from **${prev}** back to 0.\nStart again from **1**!`)]
-                    }).catch(() => {});
+                    if (ch) ch.send({ embeds: [E('#ff9900', '🔄 Count manually reset').setDescription(`An admin reset the count from **${prev}** back to 0.\nStart again from **1**!`)] }).catch(() => {});
                 }
                 return interaction.editReply({ content: `✅ Count reset from **${prev}** to 0.` });
             }
