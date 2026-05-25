@@ -330,7 +330,7 @@ function buildHelpPage(page) {
             { name:'🟢 Simple mode', value:'No resets — wrong messages are silently deleted.' },
         ).setFooter({ text:'Page 1/4' }),
         E('#5865F2','📋 Commands').setDescription('All commands:').addFields(
-            { name:'🔢 Counting', value:'`/counting channel` `/counting status` `/counting reset`' },
+            { name:'🔢 Counting', value:'`/counting channel` `/counting setcount` `/counting reset`' },
             { name:'📊 Stats', value:'`/stats [user]` `/leaderboard server` `/leaderboard global` `/leaderboard highscores`' },
             { name:'🛠️ Utilities', value:'`/calculate [expression]` `/invite` `/help` `/setup`' },
         ).setFooter({ text:'Page 2/4' }),
@@ -399,10 +399,11 @@ client.once('ready', async () => {
     const cmds = [
         new SlashCommandBuilder().setName('counting').setDescription('Configure or view the counting game')
             .addSubcommand(s=>s.setName('channel').setDescription('Set the counting channel').addChannelOption(o=>o.setName('channel').setDescription('Channel').setRequired(true)))
-            .addSubcommand(s=>s.setName('status').setDescription('View current count and settings'))
+            .addSubcommand(s=>s.setName('setcount').setDescription('Set the current count to any number (for transferring from another bot)').addIntegerOption(o=>o.setName('number').setDescription('Number to set the count to').setRequired(true).setMinValue(0).setMaxValue(10000000)))
             .addSubcommand(s=>s.setName('reset').setDescription('Manually reset the count')),
         new SlashCommandBuilder().setName('config').setDescription('Configure bot settings')
-            .addSubcommand(s=>s.setName('maxstreak').setDescription('Max consecutive counts per user').addIntegerOption(o=>o.setName('amount').setDescription('1–20').setRequired(true).setMinValue(1).setMaxValue(20)))
+            .addSubcommand(s=>s.setName('view').setDescription('View current count and settings'))
+            .addSubcommand(s=>s.setName('maxstreak').setDescription('Max consecutive counts per user').addIntegerOption(o=>o.setName('amount').setDescription('1–100').setRequired(true).setMinValue(1).setMaxValue(100)))
             .addSubcommand(s=>s.setName('expressions').setDescription('Allow math expressions').addBooleanOption(o=>o.setName('enabled').setDescription('Enable/disable').setRequired(true)))
             .addSubcommand(s=>s.setName('access').setDescription('Set which role can use config'))
             .addSubcommand(s=>s.setName('counttype').setDescription('Switch between Interactive and Simple counting mode')),
@@ -444,10 +445,13 @@ client.on('messageCreate', async message => {
 
     // ── Simple mode ───────────────────────────────────────────────────────────
     if (state.countType === 'simple') {
+        // Delete anything that isn't the exact next number
         if (value === null || value !== expected) {
             await message.delete().catch(()=>{});
             return;
         }
+        // Also delete if the message has extra content beyond the number/expression
+        // (already handled — value matched expected, so it's fine)
         state.current = value;
         state.lastUserId = message.author.id;
         if (value > state.highScore) state.highScore = value;
@@ -697,6 +701,20 @@ client.on('interactionCreate', async interaction => {
 
         if (cmd==='config') {
             const sub=options.getSubcommand();
+            if (sub==='view') {
+                await interaction.deferReply(ep());
+                const st=await getState(gid);
+                return interaction.editReply({ embeds:[E('#5865F2','📊 Counting Status').addFields(
+                    { name:'📍 Channel',  value:st.channelId?`<#${st.channelId}>`:'Not set',                               inline:true },
+                    { name:'🔢 Current',  value:`**${st.current}**`,                                                        inline:true },
+                    { name:'🏆 High',     value:`**${st.highScore}**`,                                                      inline:true },
+                    { name:'🔁 Streak',   value:`**${st.maxStreak}** in a row`,                                             inline:true },
+                    { name:'🧮 Expr',     value:st.allowExpressions?'✅ Allowed':'❌ Disabled',                             inline:true },
+                    { name:'🎮 Mode',     value:(st.countType??'interactive')==='interactive'?'🎮 Interactive':'🟢 Simple', inline:true },
+                    { name:'🔒 Access',   value:st.accessRoleId?`<@&${st.accessRoleId}>`:'Admins only',                    inline:true },
+                    { name:'👤 Last',     value:st.lastUserId?`<@${st.lastUserId}>`:'Nobody yet',                          inline:true },
+                )] });
+            }
             if (sub==='access') {
                 if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ content:'❌ Admins only.', ...ep() });
                 const state=await getState(gid);
@@ -722,18 +740,6 @@ client.on('interactionCreate', async interaction => {
 
         if (cmd==='counting') {
             const sub=options.getSubcommand();
-            if (sub==='status') {
-                await interaction.deferReply(ep());
-                const st=await getState(gid);
-                return interaction.editReply({ embeds:[E('#5865F2','📊 Counting Status').addFields(
-                    { name:'📍 Channel',  value:st.channelId?`<#${st.channelId}>`:'Not set',                          inline:true },
-                    { name:'🔢 Current',  value:`**${st.current}**`,                                                   inline:true },
-                    { name:'🏆 High',     value:`**${st.highScore}**`,                                                 inline:true },
-                    { name:'🔁 Streak',   value:`**${st.maxStreak}** in a row`,                                        inline:true },
-                    { name:'🧮 Expr',     value:st.allowExpressions?'✅ Allowed':'❌ Disabled',                        inline:true },
-                    { name:'🎮 Mode',     value:(st.countType??'interactive')==='interactive'?'🎮 Interactive':'🟢 Simple', inline:true },
-                )] });
-            }
             if (!await hasPerm(interaction,gid)) return interaction.reply({ content:'❌ No permission.', ...ep() });
             await interaction.deferReply(ep());
             const state=await getState(gid);
@@ -742,6 +748,15 @@ client.on('interactionCreate', async interaction => {
                 if (!ch.isTextBased()) return interaction.editReply({ content:'❌ Text channel required.' });
                 state.channelId=ch.id; saveState(gid,state);
                 return interaction.editReply({ embeds:[E('#5865F2','✅ Channel set').setDescription(`Counting channel set to ${ch}. Start from **1**!`)] });
+            }
+            if (sub==='setcount') {
+                const num=options.getInteger('number');
+                const prev=state.current;
+                state.current=num; state.lastUserId=null; state.consecutiveCount=0;
+                if (num > state.highScore) state.highScore=num;
+                saveState(gid,state);
+                if (state.channelId) { const ch=interaction.guild.channels.cache.get(state.channelId); if(ch) ch.send({ embeds:[E('#5865F2','🔢 Count set').setDescription(`Count manually set from **${prev}** to **${num}**. Next number is **${num+1}**.`)] }).catch(()=>{}); }
+                return interaction.editReply({ content:`✅ Count set to **${num}**. Next number is **${num+1}**.` });
             }
             if (sub==='reset') {
                 const prev=state.current; state.current=0; state.lastUserId=null; state.consecutiveCount=0; saveState(gid,state);
