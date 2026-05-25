@@ -220,15 +220,83 @@ function countTypeRow(current) {
 
 // ── Math ──────────────────────────────────────────────────────────────────────
 const CONSTS = { phi:(1+Math.sqrt(5))/2, pi:Math.PI, e:Math.E, tau:Math.PI*2, sqrt2:Math.SQRT2 };
+
+// Maps Unicode superscript digits/operators to ASCII
+const SUPERSCRIPTS = { '⁰':'0','¹':'1','²':'2','³':'3','⁴':'4','⁵':'5','⁶':'6','⁷':'7','⁸':'8','⁹':'9','⁺':'+','⁻':'-' };
+
+function normaliseSuperscripts(str) {
+    // Replace runs of superscript digits/signs that follow a number or ) with ^digits
+    // e.g. "3²" → "3^2", "x³⁴" → "x^34", "2⁻¹" → "2^-1"
+    let result = '';
+    let i = 0;
+    while (i < str.length) {
+        const ch = str[i];
+        if (SUPERSCRIPTS[ch] !== undefined) {
+            // Collect the full superscript sequence
+            let sup = '';
+            while (i < str.length && SUPERSCRIPTS[str[i]] !== undefined) {
+                sup += SUPERSCRIPTS[str[i]]; i++;
+            }
+            result += '^' + sup;
+        } else {
+            result += ch; i++;
+        }
+    }
+    return result;
+}
+
 function safeMath(expr) {
-    let c = expr.trim().toLowerCase().replace(/\s+/g,'');
+    let c = expr.trim().replace(/\s+/g,'');
     if (!c) return null;
-    for (const [n,v] of Object.entries(CONSTS)) c = c.replaceAll(n,`(${v})`);
-    if (!/^[\d.+\-*/^()]+$/.test(c)) return null;
+
+    // ── Normalise Unicode operators ───────────────────────────────────────────
+    // Superscripts: 3² → 3^2
+    c = normaliseSuperscripts(c);
+    // Multiplication: × · • → *
+    c = c.replace(/[×·•]/g, '*');
+    // Division: ÷ → /
+    c = c.replace(/÷/g, '/');
+    // Minus variants: − (minus sign) → -
+    c = c.replace(/−/g, '-');
+
+    // ── Roots ─────────────────────────────────────────────────────────────────
+    // √x  → Math.sqrt(x)    ∛x → Math.cbrt(x)    ∜x → Math.pow(x,1/4)
+    // Also support √(expr), ∛(expr), nᵗʰ root with n√x e.g. 3√8
+    c = c.replace(/(\d+(?:\.\d+)?)√/g, (_,n) => `Math.pow(`  + ',' + `1/${n})`);  // n√x pattern — handled below
+    // Simpler: replace all root symbols
+    c = c.replace(/∜/g, 'FOURTHROOT');
+    c = c.replace(/∛/g, 'CBRT');
+    c = c.replace(/√/g,  'SQRT');
+
+    c = c.toLowerCase();
+    for (const [n,v] of Object.entries(CONSTS)) c = c.replaceAll(n, `(${v})`);
+
+    // Replace root placeholders with JS functions
+    c = c.replace(/sqrt\(/g,  'Math.sqrt(');
+    c = c.replace(/cbrt\(/g,  'Math.cbrt(');
+    // For prefix root symbols without parens, wrap the next token
+    c = c.replace(/sqrt([^(])/g,  'Math.sqrt($1');
+    c = c.replace(/cbrt([^(])/g,  'Math.cbrt($1');
+    c = c.replace(/fourthroot\(/g, 'Math.pow(');   // ∜(x) → Math.pow(x — needs ,0.25) below
+    c = c.replace(/fourthroot([^(])/g, 'Math.pow($1');
+
+    // Fixup: fourthroot(x) → Math.pow(x, 0.25) — insert ,0.25 before closing paren
+    // Simple approach: replace fourthroot(…) by tracking parens
+    c = c.replace(/math\.pow\(([^,)]+)\)(?!.*,)/g, 'Math.pow($1,0.25)');
+
+    // n√x → Math.pow(x, 1/n) e.g. 3√8 → Math.pow(8,1/3)
+    c = c.replace(/(\d+(?:\.\d+)?)√([^+\-*/^()]+)/gi, 'Math.pow($2,1/$1)');
+
+    // ── Whitelist (now includes letters for Math.*) ───────────────────────────
+    if (!/^[\d.+\-*/^()Math.sqrtcbpow,]+$/.test(c)) return null;
+
     const s = c.replace(/\^/g,'**');
     if (/\*\*\s*\d{4,}/.test(s)) return null;
-    try { const r = Function('"use strict";return ('+s+')')(); return (typeof r==='number'&&isFinite(r)&&!isNaN(r)) ? Math.round(r) : null; }
-    catch { return null; }
+
+    try {
+        const r = Function('"use strict";return ('+s+')')();
+        return (typeof r==='number'&&isFinite(r)&&!isNaN(r)) ? Math.round(r) : null;
+    } catch { return null; }
 }
 function generateExpressions(n) {
     const cands=[], phi=(1+Math.sqrt(5))/2;
