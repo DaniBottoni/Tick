@@ -484,12 +484,12 @@ client.on('messageCreate', async message => {
     if (value === null) return;
 
     if (value !== expected) {
-        await message.react('❌').catch(()=>{});
+        message.react('❌').catch(()=>{});
         await triggerRuin(message.channel, gid, state, message.author.id, `sent \`${value}\` but expected \`${expected}\``);
         return;
     }
     if (state.maxStreak > 0 && message.author.id === state.lastUserId && state.consecutiveCount >= state.maxStreak) {
-        await message.react('❌').catch(()=>{});
+        message.react('❌').catch(()=>{});
         await triggerRuin(message.channel, gid, state, message.author.id, `counted more than **${state.maxStreak}** time(s) in a row`);
         return;
     }
