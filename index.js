@@ -7,7 +7,6 @@ const http = require('http');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const pool   = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, statement_timeout: 8000, connectionTimeoutMillis: 5000 });
-const pendingSaves = new Map();
 const stateCache   = new Map();
 const PS = 25, SLB_MAX = 100;
 
@@ -357,29 +356,34 @@ function buildHelpPage(page) {
 // ── Save / reset helpers ──────────────────────────────────────────────────────
 function doReset(guildId, state, userId) {
     state.current=0; state.lastUserId=null; state.consecutiveCount=0;
+    delete state.pendingSave;
     saveState(guildId, state);
     updateUserStat(guildId, userId, { ruined:1 });
 }
 async function triggerRuin(channel, guildId, state, userId, reason) {
     const prev=state.current, stats=await getUserStats(guildId, userId);
     if ((stats.saves??0) > 0) {
+        const expiresAt = Date.now() + 30_000; // 30 second window, survives restarts
         const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`saveuse_${userId}`).setLabel(`🛡️ Use Save (${stats.saves} left)`).setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`savedecline_${userId}`).setLabel('❌ Let it reset').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(`saveuse_${userId}_${prev}_${guildId}_${expiresAt}`).setLabel(`🛡️ Use Save (${stats.saves} left)`).setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`savedecline_${userId}_${prev}_${guildId}_${expiresAt}`).setLabel('❌ Let it reset').setStyle(ButtonStyle.Danger),
         );
         const prompt = await channel.send({
-            embeds:[E('#ff9900','⚠️ Count almost ruined!').setDescription(`<@${userId}> made a mistake! (${reason})\nYou have a **🛡️ Save** — use it within **15 seconds** to keep the count at **${prev}**!`)
+            embeds:[E('#ff9900','⚠️ Count almost ruined!').setDescription(`<@${userId}> made a mistake! (${reason})\nYou have a **🛡️ Save** — use it within **30 seconds** to keep the count at **${prev}**!`)
                 .addFields({ name:'🛡️ Saves',value:`**${stats.saves}**`,inline:true },{ name:'🔢 At risk',value:`**${prev}**`,inline:true })],
             components:[row],
         }).catch(()=>null);
         if (!prompt) { doReset(guildId, state, userId); return; }
-        const tid = setTimeout(async () => {
-            if (!pendingSaves.has(prompt.id)) return;
-            pendingSaves.delete(prompt.id);
-            doReset(guildId, state, userId);
+        // Store pending save in DB so it survives restarts
+        state.pendingSave = { msgId: prompt.id, userId, prevCount: prev, expiresAt };
+        saveState(guildId, state);
+        // Still clean up the message visually after 30s
+        setTimeout(async () => {
+            const fresh = await getState(guildId);
+            if (!fresh.pendingSave || fresh.pendingSave.msgId !== prompt.id) return; // already handled
+            doReset(guildId, fresh, userId);
             await prompt.edit({ embeds:[E('#ff4444','💥 Save expired!').setDescription(`<@${userId}> didn't use their save in time. Resets from **${prev}** to **1**.`)], components:[] }).catch(()=>{});
-        }, 15_000);
-        pendingSaves.set(prompt.id, { guildId, userId, prevCount:prev, timeoutId:tid, state:{...state} });
+        }, 30_000);
     } else {
         doReset(guildId, state, userId);
         await channel.send({ embeds:[E('#ff4444','💥 Count ruined!').setDescription(`<@${userId}> ruined the count! (${reason})\nCount was at **${prev}**.`).addFields({ name:'🔄 Reset to',value:'**1**',inline:true },{ name:'🏆 High Score',value:`**${state.highScore}**`,inline:true }).setFooter({ text:'Start again from 1!' })] }).catch(()=>{});
@@ -435,7 +439,8 @@ client.on('messageCreate', async message => {
     const gid   = message.guild.id;
     const state = await getState(gid).catch(()=>null);
     if (!state?.channelId || message.channel.id !== state.channelId) return;
-    if ([...pendingSaves.values()].some(p=>p.guildId===gid)) return;
+    // Block new counts while a save prompt is active for this guild
+    if (state.pendingSave && Date.now() < state.pendingSave.expiresAt) return;
 
     const raw = message.content.trim();
     const hasConst = Object.keys(CONSTS).some(c=>raw.toLowerCase().includes(c));
@@ -576,27 +581,40 @@ client.on('interactionCreate', async interaction => {
         }
 
         // ── Saves ─────────────────────────────────────────────────────────────
-        if (id.startsWith('saveuse_')) {
-            const oid = id.split('_')[1];
-            if (interaction.user.id !== oid) return interaction.reply({ content:'❌ Only the person who ruined the count can use their save!', ...ep() });
-            const pend = pendingSaves.get(interaction.message.id);
-            if (!pend) return interaction.reply({ content:'❌ Save prompt already expired.', ...ep() });
-            clearTimeout(pend.timeoutId); pendingSaves.delete(interaction.message.id);
-            const state = await getState(pend.guildId);
-            state.current=pend.prevCount; state.lastUserId=oid; state.consecutiveCount=1;
-            saveState(pend.guildId, state);
-            await updateUserStat(pend.guildId, oid, { saves:-1, savesUsed:1 });
-            const upd = await getUserStats(pend.guildId, oid);
-            return interaction.update({ embeds:[E('#00cc88','🛡️ Save used!').setDescription(`<@${oid}> used a **Save** — count stays at **${pend.prevCount}**!`).addFields({ name:'🛡️ Remaining',value:`**${upd.saves??0}**`,inline:true },{ name:'🔢 Continues at',value:`**${pend.prevCount}**`,inline:true })], components:[] });
-        }
-        if (id.startsWith('savedecline_')) {
-            const oid = id.split('_')[1];
-            if (interaction.user.id !== oid) return interaction.reply({ content:'❌ Only the person who ruined the count can decline.', ...ep() });
-            const pend = pendingSaves.get(interaction.message.id);
-            if (!pend) return interaction.reply({ content:'❌ Save prompt already expired.', ...ep() });
-            clearTimeout(pend.timeoutId); pendingSaves.delete(interaction.message.id);
-            doReset(pend.guildId, pend.state, oid);
-            return interaction.update({ embeds:[E('#ff4444','💥 Count ruined!').setDescription(`<@${oid}> declined their save. Resets from **${pend.prevCount}** to **1**.`).addFields({ name:'🏆 High Score',value:`**${pend.state.highScore}**`,inline:true })], components:[] });
+        if (id.startsWith('saveuse_') || id.startsWith('savedecline_')) {
+            // customId format: saveuse_{userId}_{prevCount}_{guildId}_{expiresAt}
+            const parts   = id.split('_');
+            const action   = parts[0];             // saveuse / savedecline
+            const ownerId  = parts[1];
+            const prevCount= parseInt(parts[2]);
+            const btnGid   = parts[3];
+            const expiresAt= parseInt(parts[4]);
+
+            if (interaction.user.id !== ownerId)
+                return interaction.reply({ content:'❌ Only the person who ruined the count can do this!', ...ep() });
+            if (Date.now() > expiresAt)
+                return interaction.reply({ content:'❌ Save prompt has expired (30s window).', ...ep() });
+
+            // Verify the DB still has this save pending (guards against double-clicks)
+            const state = await getState(btnGid);
+            if (!state.pendingSave || state.pendingSave.msgId !== interaction.message.id)
+                return interaction.reply({ content:'❌ This save was already resolved.', ...ep() });
+
+            // Clear the pending save from DB immediately to prevent double-use
+            delete state.pendingSave;
+
+            if (action === 'saveuse') {
+                state.current=prevCount; state.lastUserId=ownerId; state.consecutiveCount=1;
+                saveState(btnGid, state);
+                await updateUserStat(btnGid, ownerId, { saves:-1, savesUsed:1 });
+                const upd = await getUserStats(btnGid, ownerId);
+                return interaction.update({ embeds:[E('#00cc88','🛡️ Save used!').setDescription(`<@${ownerId}> used a **Save** — count stays at **${prevCount}**!`).addFields({ name:'🛡️ Remaining',value:`**${upd.saves??0}**`,inline:true },{ name:'🔢 Continues at',value:`**${prevCount}**`,inline:true })], components:[] });
+            } else {
+                state.current=0; state.lastUserId=null; state.consecutiveCount=0;
+                saveState(btnGid, state);
+                updateUserStat(btnGid, ownerId, { ruined:1 });
+                return interaction.update({ embeds:[E('#ff4444','💥 Count ruined!').setDescription(`<@${ownerId}> declined their save. Resets from **${prevCount}** to **1**.`).addFields({ name:'🏆 High Score',value:`**${state.highScore}**`,inline:true })], components:[] });
+            }
         }
 
         // ── Stats tabs ────────────────────────────────────────────────────────
