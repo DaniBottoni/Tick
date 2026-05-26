@@ -16,7 +16,21 @@ async function initDB() {
         CREATE TABLE IF NOT EXISTS counting   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS user_stats (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL DEFAULT '{}', PRIMARY KEY (guild_id, user_id));
         CREATE INDEX IF NOT EXISTS user_stats_user ON user_stats(user_id);
+        CREATE TABLE IF NOT EXISTS dedup (message_id TEXT PRIMARY KEY, claimed_at TIMESTAMPTZ DEFAULT NOW());
     `);
+    // Clean up dedup entries older than 5 minutes
+    pool.query(`DELETE FROM dedup WHERE claimed_at < NOW() - INTERVAL '5 minutes'`).catch(()=>{});
+}
+
+// Returns true if THIS instance should handle this message (false = another instance got there first)
+async function claimMessage(messageId) {
+    try {
+        const r = await pool.query(
+            'INSERT INTO dedup (message_id) VALUES ($1) ON CONFLICT (message_id) DO NOTHING RETURNING message_id',
+            [messageId]
+        );
+        return r.rowCount > 0;
+    } catch { return true; } // on DB error, allow processing so the bot doesn't go silent
 }
 function defaultState() {
     return { channelId: null, current: 0, lastUserId: null, consecutiveCount: 0, maxStreak: 1, allowExpressions: true, highScore: 0, accessRoleId: null, countType: 'interactive' };
@@ -484,11 +498,13 @@ client.on('messageCreate', async message => {
     if (value === null) return;
 
     if (value !== expected) {
+        if (!await claimMessage(message.id)) return; // another instance already handling this
         message.react('❌').catch(()=>{});
         await triggerRuin(message.channel, gid, state, message.author.id, `sent \`${value}\` but expected \`${expected}\``);
         return;
     }
     if (state.maxStreak > 0 && message.author.id === state.lastUserId && state.consecutiveCount >= state.maxStreak) {
+        if (!await claimMessage(message.id)) return;
         message.react('❌').catch(()=>{});
         await triggerRuin(message.channel, gid, state, message.author.id, `counted more than **${state.maxStreak}** time(s) in a row`);
         return;
