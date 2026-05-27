@@ -16,6 +16,24 @@ async function initDB() {
         CREATE TABLE IF NOT EXISTS counting   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS user_stats (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL DEFAULT '{}', PRIMARY KEY (guild_id, user_id));
         CREATE INDEX IF NOT EXISTS user_stats_user ON user_stats(user_id);
+        CREATE TABLE IF NOT EXISTS dedup (messag const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits,
+        EmbedBuilder, ActivityType, MessageFlags, ActionRowBuilder,
+        ButtonBuilder, ButtonStyle, RoleSelectMenuBuilder, ChannelSelectMenuBuilder, ChannelType } = require('discord.js');
+const { Pool } = require('pg');
+require('dns').setDefaultResultOrder('ipv4first');
+const http = require('http');
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, statement_timeout: 8000, connectionTimeoutMillis: 5000 });
+const stateCache = new Map();
+const PS = 25, SLB_MAX = 100;
+
+// ── DB ────────────────────────────────────────────────────────────────────────
+async function initDB() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS counting   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS user_stats (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL DEFAULT '{}', PRIMARY KEY (guild_id, user_id));
+        CREATE INDEX IF NOT EXISTS user_stats_user ON user_stats(user_id);
         CREATE TABLE IF NOT EXISTS dedup (message_id TEXT PRIMARY KEY, claimed_at TIMESTAMPTZ DEFAULT NOW());
     `);
     pool.query(`DELETE FROM dedup WHERE claimed_at < NOW() - INTERVAL '5 minutes'`).catch(() => {});
@@ -506,7 +524,16 @@ client.on('messageCreate', async message => {
     const expected = state.current + 1;
 
     if (state.countType === 'simple') {
-        if (value === null || value !== expected) { await message.delete().catch(() => {}); return; }
+        const streakViolation = state.maxStreak > 0 && message.author.id === state.lastUserId && state.consecutiveCount >= state.maxStreak;
+        if (value === null || value !== expected || streakViolation) {
+            const me = message.guild.members.me;
+            if (!me?.permissionsIn(message.channel).has(PermissionFlagsBits.ManageMessages)) {
+                console.error('Simple mode: missing ManageMessages permission in channel', message.channel.id);
+                return;
+            }
+            await message.delete().catch(e => console.error('Simple mode delete failed:', e.message));
+            return;
+        }
         state.current = value; state.lastUserId = message.author.id;
         if (value > state.highScore) state.highScore = value;
         saveState(gid, state);
