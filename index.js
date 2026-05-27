@@ -440,11 +440,11 @@ async function triggerRuin(channel, guildId, state, userId, reason) {
             const fresh = await getState(guildId);
             if (!fresh.pendingSave || fresh.pendingSave.expiresAt !== expiresAt) return;
             doReset(guildId, fresh, userId);
-            await prompt.edit({ content: `💥 **Save expired!** <@${userId}> — count resets from **${prev}** to **1**.`, embeds: [E('#ff4444', '💥 Save expired!').setDescription(`<@${userId}> didn't use their save in time. Resets from **${prev}** to **1**.`)], components: [] }).catch(() => {});
+            await prompt.edit({ embeds: [E('#ff4444', '💥 Save expired!').setDescription(`<@${userId}> didn't use their save in time. Resets from **${prev}** to **1**.`)], components: [] }).catch(() => {});
         }, 60_000);
     } else {
         doReset(guildId, state, userId);
-        await channel.send({ content: `💥 **Count ruined!** <@${userId}> ruined the count at **${prev}**. Back to **1**!`, embeds: [E('#ff4444', '💥 Count ruined!').setDescription(`<@${userId}> ruined the count! (${reason})\nCount was at **${prev}**.`).addFields({ name: 'Reset to', value: '**1**', inline: true }, { name: 'High Score', value: `**${state.highScore}**`, inline: true }).setFooter({ text: 'Start again from 1!' })] }).catch(e => console.error('ruin msg failed:', e.message));
+        await channel.send({ embeds: [E('#ff4444', '💥 Count ruined!').setDescription(`<@${userId}> ruined the count! (${reason})\nCount was at **${prev}**.`).addFields({ name: 'Reset to', value: '**1**', inline: true }, { name: 'High Score', value: `**${state.highScore}**`, inline: true }).setFooter({ text: 'Start again from 1!' })] }).catch(e => console.error('ruin msg failed:', e.message));
     }
 }
 
