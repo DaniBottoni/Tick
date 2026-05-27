@@ -532,12 +532,10 @@ client.on('messageCreate', async message => {
         if (s) setTimeout(() => s.delete().catch(() => {}), 5000);
         return;
     }
-    if (value === null) return;
-
-    if (value !== expected) {
+    if (value === null || value !== expected) {
         if (!await claimMessage(message.id)) return;
         message.react('❌').catch(() => {});
-        await triggerRuin(message.channel, gid, state, message.author.id, `sent \`${value}\` but expected \`${expected}\``);
+        await triggerRuin(message.channel, gid, state, message.author.id, value === null ? `sent a non-number` : `sent \`${value}\` but expected \`${expected}\``);
         return;
     }
     if (state.maxStreak > 0 && message.author.id === state.lastUserId && state.consecutiveCount >= state.maxStreak) {
