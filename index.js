@@ -10,25 +10,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejec
 const stateCache = new Map();
 const PS = 25, SLB_MAX = 100;
 
-// ── DB ────────────────────────────────────────────────────────────────────────
-async function initDB() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS counting   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
-        CREATE TABLE IF NOT EXISTS user_stats (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL DEFAULT '{}', PRIMARY KEY (guild_id, user_id));
-        CREATE INDEX IF NOT EXISTS user_stats_user ON user_stats(user_id);
-        CREATE TABLE IF NOT EXISTS dedup (messag const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits,
-        EmbedBuilder, ActivityType, MessageFlags, ActionRowBuilder,
-        ButtonBuilder, ButtonStyle, RoleSelectMenuBuilder, ChannelSelectMenuBuilder, ChannelType } = require('discord.js');
-const { Pool } = require('pg');
-require('dns').setDefaultResultOrder('ipv4first');
-const http = require('http');
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, statement_timeout: 8000, connectionTimeoutMillis: 5000 });
-const stateCache = new Map();
-const PS = 25, SLB_MAX = 100;
-
-// ── DB ────────────────────────────────────────────────────────────────────────
+// DB 
 async function initDB() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS counting   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
@@ -62,7 +44,7 @@ function saveState(guildId, data) {
     pool.query('INSERT INTO counting (guild_id,data) VALUES ($1,$2) ON CONFLICT (guild_id) DO UPDATE SET data=$2', [guildId, data]).catch(e => console.error('saveState:', e.message));
 }
 
-// ── Stats ─────────────────────────────────────────────────────────────────────
+// Stats 
 async function updateUserStat(guildId, userId, delta) {
     try {
         const r = await pool.query('SELECT data FROM user_stats WHERE guild_id=$1 AND user_id=$2', [guildId, userId]);
@@ -85,7 +67,7 @@ async function getServerStats(gid) {
     return r.rows[0] ?? {};
 }
 
-// ── Paginated queries ─────────────────────────────────────────────────────────
+// Paginated queries 
 async function getServerLbPage(gid, page) {
     const off = Math.min((page - 1) * PS, SLB_MAX - PS);
     const [rows, tot] = await Promise.all([
@@ -119,7 +101,7 @@ async function getHighscoresPage(page) {
     return { rows: rows.rows, total: parseInt(tot.rows[0].cnt) };
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Helpers 
 const M = ['🥇', '🥈', '🥉'];
 const E = (color, title) => new EmbedBuilder().setColor(color).setTitle(title);
 const ep = () => ({ flags: [MessageFlags.Ephemeral] });
@@ -134,7 +116,7 @@ async function hasPerm(interaction, guildId) {
     return s.accessRoleId ? interaction.member.roles.cache.has(s.accessRoleId) : false;
 }
 
-// ── Embed builders ────────────────────────────────────────────────────────────
+// Embed builders 
 async function buildUserStatsEmbed(gid, user) {
     const [st, rank, gs] = await Promise.all([getUserStats(gid, user.id), getUserRank(gid, user.id), getState(gid)]);
     const tot = (st.correct || 0) + (st.ruined || 0), acc = tot > 0 ? Math.round((st.correct / tot) * 100) : 100;
@@ -192,7 +174,7 @@ async function buildHighscoresEmbed(page) {
     return { totalPages: tp, embed: E('#5865F2', '🏅 All-Time High Score Leaderboard').setDescription(lines.join('\n')).setFooter({ text: `Page ${page}/${tp} · ranked by all-time high score` }) };
 }
 
-// ── Setup embed ───────────────────────────────────────────────────────────────
+// Setup embed 
 function buildSetupEmbed(state) {
     const ct = state.countType ?? 'interactive';
     return {
@@ -223,7 +205,7 @@ function buildSetupEmbed(state) {
     };
 }
 
-// ── Component rows ────────────────────────────────────────────────────────────
+// Component rows 
 const B = (id, label, active) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(active ? ButtonStyle.Primary : ButtonStyle.Secondary);
 function statsRow(uid, gid, active) {
     return new ActionRowBuilder().addComponents(B(`stats_user_${uid}_${gid}`, 'User Stats', active === 'user'), B(`stats_server_${uid}_${gid}`, 'Server Stats', active === 'server'));
@@ -247,7 +229,7 @@ function countTypeRow(current) {
     );
 }
 
-// ── Math (complex number evaluator) ──────────────────────────────────────────
+// Math (complex number evaluator) 
 const SUP = { '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9', '⁺': '+', '⁻': '-' };
 
 class C {
@@ -392,7 +374,7 @@ function generateExpressions(n) {
     return res.slice(0, 3);
 }
 
-// ── Help ──────────────────────────────────────────────────────────────────────
+// Help 
 function buildHelpPage(page) {
     const pages = [
         E('#5865F2', '🎮 How to Play').setDescription('Count up together in the counting channel! Anyone who breaks the chain resets it to 1.').addFields(
@@ -428,7 +410,7 @@ function buildHelpPage(page) {
     return { embeds: [pages[page - 1]], components: [row] };
 }
 
-// ── Save / reset helpers ──────────────────────────────────────────────────────
+// Save / reset helpers 
 function doReset(guildId, state, userId) {
     state.current = 0; state.lastUserId = null; state.consecutiveCount = 0;
     delete state.pendingSave;
@@ -466,13 +448,13 @@ async function triggerRuin(channel, guildId, state, userId, reason) {
     }
 }
 
-// ── Keep-alive ────────────────────────────────────────────────────────────────
+// Keep-alive 
 function keepAlive() {
     const ping = () => { const u = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`; (u.startsWith('https') ? require('https') : http).get(u, () => {}).on('error', () => {}); };
     setTimeout(ping, 5000); setInterval(ping, 14 * 60 * 1000);
 }
 
-// ── Ready ─────────────────────────────────────────────────────────────────────
+// Ready 
 client.once('ready', async () => {
     console.log(`Online as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: 'Counting things', type: ActivityType.Watching }], status: 'online' });
@@ -509,7 +491,7 @@ client.once('ready', async () => {
     keepAlive();
 });
 
-// ── Message counting ──────────────────────────────────────────────────────────
+// Message counting 
 client.on('messageCreate', async message => {
     if (message.author.bot || !message.guild) return;
     const gid = message.guild.id;
@@ -582,7 +564,7 @@ client.on('messageCreate', async message => {
     if (value % 100 === 0) await message.channel.send({ embeds: [E('#00cc88', `🎉 ${value} reached!`).setDescription(`The count hit **${value}** thanks to <@${message.author.id}>!`).setFooter({ text: `High score: ${state.highScore}` })] }).catch(() => {});
 });
 
-// ── Interactions ──────────────────────────────────────────────────────────────
+// Interactions 
 client.on('interactionCreate', async interaction => {
     const gid = interaction.guild?.id;
 
