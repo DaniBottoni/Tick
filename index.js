@@ -33,7 +33,7 @@ async function claimMessage(messageId) {
     } catch { return true; } // on DB error, allow processing so the bot doesn't go silent
 }
 function defaultState() {
-    return { channelId: null, current: 0, lastUserId: null, consecutiveCount: 0, maxStreak: 1, allowExpressions: true, highScore: 0, accessRoleId: null, countType: 'interactive' };
+    return { channelId: null, current: 0, lastUserId: null, consecutiveCount: 0, maxStreak: 1, allowExpressions: true, highScore: 0, accessRoleId: null, countType: 'interactive', saves: 0, savesUsed: 0 };
 }
 async function getState(guildId) {
     if (stateCache.has(guildId)) return stateCache.get(guildId);
@@ -129,9 +129,8 @@ async function buildUserStatsEmbed(gid, user) {
         { name:'🏅 Rank',       value:`**#${rank}**`,                          inline:true },
         { name:'🔢 Current',    value:`**${gs.current}**`,                     inline:true },
         { name:'🏆 High score', value:`**${gs.highScore}**`,                   inline:true },
-        { name:'🛡️ Saves',     value:`**${st.saves??0}**`,                    inline:true },
-        { name:'⏳ Next save',  value:`**${50-((st.correct??0)%50)}** counts`, inline:true },
-        { name:'🔖 Used',       value:`**${st.savesUsed??0}**`,                inline:true },
+        { name:'🛡️ Server saves', value:`**${gs.saves??0}**`,   inline:true },
+        { name:'🔖 Saves used',    value:`**${gs.savesUsed??0}**`, inline:true },
     );
 }
 async function buildServerStatsEmbed(guild) {
@@ -189,6 +188,7 @@ function buildSetupEmbed(state) {
                 { name:'🔁 Max Streak',        value: `**${state.maxStreak}** in a row`,                       inline:true },
                 { name:'🧮 Expressions',       value: state.allowExpressions ? '✅ Allowed' : '❌ Disabled',   inline:true },
                 { name:'🔒 Access Role',       value: state.accessRoleId ? `<@&${state.accessRoleId}>` : 'Admins only', inline:true },
+                { name:'🛡️ Server Saves',     value: `**${state.saves??0}**`,                                          inline:true },
                 { name:'🔢 Current Count',     value: `**${state.current}**`,                                  inline:true },
             )
         ],
@@ -396,7 +396,7 @@ function buildHelpPage(page) {
             { name:'✅ Correct', value:'React added, count goes up' },
             { name:'❌ Wrong / too fast', value:'Count resets!' },
             { name:'🏆 Milestones', value:'Bot celebrates every 100 counts' },
-            { name:'🛡️ Saves', value:'1 save every 50 correct counts — use within 15s to undo a ruin!' },
+            { name:'🛡️ Saves', value:'The server earns 1 save every 50 counts. Anyone can use it within 1 minute to undo a ruin!' },
             { name:'🟢 Simple mode', value:'No resets — wrong messages are silently deleted.' },
         ).setFooter({ text:'Page 1/4' }),
         E('#5865F2','📋 Commands').setDescription('All commands:').addFields(
@@ -435,19 +435,18 @@ async function triggerRuin(channel, guildId, state, userId, reason) {
     const prev = state.current;
 
     // Set a placeholder immediately (before any awaits) so concurrent messages are blocked
-    const expiresAt = Date.now() + 30_000;
+    const expiresAt = Date.now() + 60_000;
     state.pendingSave = { placeholder: true, userId, prevCount: prev, expiresAt };
     saveState(guildId, state);
 
-    const stats = await getUserStats(guildId, userId);
-    if ((stats.saves??0) > 0) {
+    if ((state.saves??0) > 0) {
         const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`saveuse_${userId}_${prev}_${guildId}_${expiresAt}`).setLabel(`🛡️ Use Save (${stats.saves} left)`).setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`saveuse_${userId}_${prev}_${guildId}_${expiresAt}`).setLabel(`🛡️ Use Save (${state.saves} left)`).setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`savedecline_${userId}_${prev}_${guildId}_${expiresAt}`).setLabel('❌ Let it reset').setStyle(ButtonStyle.Danger),
         );
         const prompt = await channel.send({
-            embeds:[E('#ff9900','⚠️ Count almost ruined!').setDescription(`<@${userId}> made a mistake! (${reason})\nYou have a **🛡️ Save** — use it within **30 seconds** to keep the count at **${prev}**!`)
-                .addFields({ name:'🛡️ Saves',value:`**${stats.saves}**`,inline:true },{ name:'🔢 At risk',value:`**${prev}**`,inline:true })],
+            embeds:[E('#ff9900','⚠️ Count almost ruined!').setDescription(`<@${userId}> made a mistake! (${reason})\nYou have a **🛡️ Save** — use it within **1 minute** to keep the count at **${prev}**!`)
+                .addFields({ name:'🛡️ Server saves',value:`**${state.saves}**`,inline:true },{ name:'🔢 At risk',value:`**${prev}**`,inline:true })],
             components:[row],
         }).catch(()=>null);
         if (!prompt) { doReset(guildId, state, userId); return; }
@@ -460,7 +459,7 @@ async function triggerRuin(channel, guildId, state, userId, reason) {
             if (!fresh.pendingSave || fresh.pendingSave.expiresAt !== expiresAt) return; // already handled by button click
             doReset(guildId, fresh, userId);
             await prompt.edit({ embeds:[E('#ff4444','💥 Save expired!').setDescription(`<@${userId}> didn't use their save in time. Resets from **${prev}** to **1**.`)], components:[] }).catch(()=>{});
-        }, 30_000);
+        }, 60_000);
     } else {
         doReset(guildId, state, userId);
         await channel.send({ embeds:[E('#ff4444','💥 Count ruined!').setDescription(`<@${userId}> ruined the count! (${reason})\nCount was at **${prev}**.`).addFields({ name:'🔄 Reset to',value:'**1**',inline:true },{ name:'🏆 High Score',value:`**${state.highScore}**`,inline:true }).setFooter({ text:'Start again from 1!' })] }).catch(()=>{});
@@ -572,13 +571,12 @@ client.on('messageCreate', async message => {
     if (value > state.highScore) state.highScore = value;
     saveState(gid, state);
 
-    const earnedSave = value % 50 === 0; // channel count hit a milestone: 50, 100, 150, 200...
-    const delta = { correct: 1 };
-    if (earnedSave) delta.saves = 1;
-    const ns = await updateUserStat(gid, message.author.id, delta);
-
-    if (earnedSave && ns) {
-        await message.channel.send({ embeds:[E('#ffd700','🛡️ Save earned!').setDescription(`<@${message.author.id}> earned a **Save** for counting **${value}**!\nYou now have **${ns.saves ?? 1}** save(s).`)] }).catch(()=>{});
+    const earnedSave = value % 50 === 0;
+    const ns = await updateUserStat(gid, message.author.id, { correct: 1 });
+    if (earnedSave) {
+        state.saves = (state.saves ?? 0) + 1;
+        saveState(gid, state);
+        await message.channel.send({ embeds:[E('#ffd700','🛡️ Save earned!').setDescription(`The server earned a **🛡️ Save** for reaching **${value}**!\nThe server now has **${state.saves}** save(s).`)] }).catch(()=>{});
     }
     const ne = ['0️⃣','1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣'];
     await message.react(value<=9?ne[value]:'✅').catch(()=>{});
@@ -676,18 +674,18 @@ client.on('interactionCreate', async interaction => {
 
             // Read fresh state and stats — no msgId check, just trust the timestamp + saves count
             const state = await getState(btnGid);
-            const stats = await getUserStats(btnGid, ownerId);
             delete state.pendingSave;
 
             if (action === 'saveuse') {
-                if ((stats.saves ?? 0) < 1)
-                    return interaction.reply({ content:'❌ You have no saves left.', ...ep() });
+                if ((state.saves ?? 0) < 1)
+                    return interaction.reply({ content:'❌ The server has no saves left.', ...ep() });
                 state.current=prevCount; state.lastUserId=ownerId; state.consecutiveCount=1;
+                state.saves = (state.saves ?? 1) - 1;
+                state.savesUsed = (state.savesUsed ?? 0) + 1;
                 saveState(btnGid, state);
-                await updateUserStat(btnGid, ownerId, { saves:-1, savesUsed:1 });
-                const upd = await getUserStats(btnGid, ownerId);
+                await updateUserStat(btnGid, ownerId, { savesUsed:1 });
                 return interaction.update({
-                    embeds:[E('#00cc88','🛡️ Save used!').setDescription(`<@${ownerId}> used a **Save** — count stays at **${prevCount}**!`).addFields({ name:'🛡️ Remaining',value:`**${upd.saves??0}**`,inline:true },{ name:'🔢 Continues at',value:`**${prevCount}**`,inline:true })],
+                    embeds:[E('#00cc88','🛡️ Save used!').setDescription(`<@${ownerId}> used a server **Save** — count stays at **${prevCount}**!`).addFields({ name:'🛡️ Remaining',value:`**${state.saves}**`,inline:true },{ name:'🔢 Continues at',value:`**${prevCount}**`,inline:true })],
                     components:[],
                 });
             } else {
@@ -695,7 +693,7 @@ client.on('interactionCreate', async interaction => {
                 saveState(btnGid, state);
                 updateUserStat(btnGid, ownerId, { ruined:1 });
                 return interaction.update({
-                    embeds:[E('#ff4444','💥 Count ruined!').setDescription(`<@${ownerId}> declined their save. Resets from **${prevCount}** to **1**.`).addFields({ name:'🏆 High Score',value:`**${state.highScore}**`,inline:true })],
+                    embeds:[E('#ff4444','💥 Count ruined!').setDescription(`<@${ownerId}> declined the save. Resets from **${prevCount}** to **1**.`).addFields({ name:'🏆 High Score',value:`**${state.highScore}**`,inline:true })],
                     components:[],
                 });
             }
@@ -817,6 +815,7 @@ client.on('interactionCreate', async interaction => {
                     { name:'🧮 Expr',     value:st.allowExpressions?'✅ Allowed':'❌ Disabled',                             inline:true },
                     { name:'🎮 Mode',     value:(st.countType??'interactive')==='interactive'?'🎮 Interactive':'🟢 Simple', inline:true },
                     { name:'🔒 Access',   value:st.accessRoleId?`<@&${st.accessRoleId}>`:'Admins only',                    inline:true },
+                    { name:'🛡️ Saves',   value:`**${st.saves??0}**`,                                                        inline:true },
                     { name:'👤 Last',     value:st.lastUserId?`<@${st.lastUserId}>`:'Nobody yet',                          inline:true },
                 )] });
             }
