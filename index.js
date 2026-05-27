@@ -497,7 +497,11 @@ client.on('messageCreate', async message => {
     const gid = message.guild.id;
     const state = await getState(gid).catch(() => null);
     if (!state?.channelId || message.channel.id !== state.channelId) return;
-    if (state.pendingSave && Date.now() < state.pendingSave.expiresAt) return;
+    if (state.pendingSave) {
+        if (Date.now() < state.pendingSave.expiresAt) return;
+        delete state.pendingSave;
+        saveState(gid, state);
+    }
 
     const raw = message.content.trim();
     const hasConst = Object.keys(CONSTS).some(c => raw.toLowerCase().includes(c));
