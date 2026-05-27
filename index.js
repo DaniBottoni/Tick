@@ -432,7 +432,7 @@ async function triggerRuin(channel, guildId, state, userId, reason) {
             embeds: [E('#ff9900', '⚠️ Count almost ruined!').setDescription(`<@${userId}> made a mistake! (${reason})\nYou have a **Save** — use it within **1 minute** to keep the count at **${prev}**!`)
                 .addFields({ name: 'Server saves', value: `**${state.saves}**`, inline: true }, { name: 'At risk', value: `**${prev}**`, inline: true })],
             components: [row],
-        }).catch(() => null);
+        }).catch(e => { console.error('triggerRuin save prompt failed:', e.message); return null; });
         if (!prompt) { doReset(guildId, state, userId); return; }
         state.pendingSave = { msgId: prompt.id, userId, prevCount: prev, expiresAt };
         saveState(guildId, state);
