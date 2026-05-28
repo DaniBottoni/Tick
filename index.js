@@ -528,6 +528,8 @@ client.on('messageCreate', async message => {
         const sameUser = message.author.id === state.lastUserId;
         const newStreak = sameUser ? state.consecutiveCount + 1 : 1;
         const streakViolation = state.maxStreak > 0 && sameUser && newStreak > state.maxStreak;
+        const isAttempt = value !== null || isExpr; // plain text messages are not attempts
+        if (!isAttempt) return; // leave non-number messages alone
         if (value === null || value !== expected || streakViolation) {
             const me = message.guild.members.me;
             if (!me?.permissionsIn(message.channel).has(PermissionFlagsBits.ManageMessages)) {
