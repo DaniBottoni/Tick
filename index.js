@@ -253,7 +253,18 @@ const CCONSTS = {
     pi: new C(Math.PI), e: new C(Math.E), phi: new C((1 + Math.sqrt(5)) / 2),
     tau: new C(Math.PI * 2), sqrt2: new C(Math.SQRT2), i: new C(0, 1),
 };
-const CFUNCS_REAL = { floor: v => new C(Math.floor(v.r)), ceil: v => new C(Math.ceil(v.r)), abs: v => new C(Math.hypot(v.r, v.i)) };
+// Lambert W function (principal branch W₀) via Halley's method
+function lambertW(x) {
+    if (x < -1/Math.E) return NaN;
+    let w = x < 1 ? x : Math.log(x);
+    for (let i = 0; i < 100; i++) {
+        const ew = Math.exp(w), wew = w * ew, f = wew - x, df = ew * (w + 1);
+        const dw = f / (df - (w + 2) * f / (2 * (w + 1)));
+        w -= dw; if (Math.abs(dw) < 1e-12) break;
+    }
+    return w;
+}
+const CFUNCS_REAL = { floor: v => new C(Math.floor(v.r)), ceil: v => new C(Math.ceil(v.r)), abs: v => new C(Math.hypot(v.r, v.i)), lambertw: v => new C(lambertW(v.r)), lw: v => new C(lambertW(v.r)) };
 const CONSTS = { phi: (1 + Math.sqrt(5)) / 2, pi: Math.PI, e: Math.E, tau: Math.PI * 2, sqrt2: Math.SQRT2 };
 
 function safeMath(expr) {
@@ -281,7 +292,7 @@ function safeMath(expr) {
         } else k++;
     }
 
-    const FUNCS = new Set(['sqrt', 'cbrt', 'floor', 'ceil', 'abs']);
+    const FUNCS = new Set(['sqrt', 'cbrt', 'floor', 'ceil', 'abs', 'lambertw', 'lw']);
     const isFunc = v => FUNCS.has(v) || /^nrt\d+$/.test(v);
     const out = [];
     for (let j = 0; j < tokens.length; j++) {
@@ -826,3 +837,4 @@ client.login(process.env.DISCORD_TOKEN);
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => { const ok = req.url === '/' || req.url === '/health'; res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' }); res.end(ok ? 'Counting bot running!' : 'Not found'); }).listen(PORT, () => console.log(`HTTP on port ${PORT}`));
+
