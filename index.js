@@ -519,7 +519,7 @@ client.on('messageCreate', async message => {
     }
 
     const raw = message.content.trim();
-    const hasConst = Object.keys(CONSTS).some(c => raw.toLowerCase().includes(c));
+    const hasConst = Object.keys(CONSTS).some(c => new RegExp(`(?<![a-z])${c}(?![a-z])`, 'i').test(raw));
     const isExpr = (/[+\-*/^()]/.test(raw) && !/^\-?\d+$/.test(raw)) || hasConst;
     const value = safeMath(raw);
     const expected = state.current + 1;
