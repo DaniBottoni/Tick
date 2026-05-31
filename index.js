@@ -6,7 +6,7 @@ require('dns').setDefaultResultOrder('ipv4first');
 const http = require('http');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, statement_timeout: 8000, connectionTimeoutMillis: 5000 });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, statement_timeout: 8000, connectionTimeoutMillis: 5000, idleTimeoutMillis: 600000, max: 3 });
 const stateCache = new Map();
 const PS = 25, SLB_MAX = 100;
 
@@ -542,7 +542,7 @@ client.on('messageCreate', async message => {
         state.current = value; state.lastUserId = message.author.id; state.consecutiveCount = newStreak;
         if (value > state.highScore) state.highScore = value;
         saveState(gid, state);
-        await updateUserStat(gid, message.author.id, { correct: 1 });
+        updateUserStat(gid, message.author.id, { correct: 1 }); // fire-and-forget
         const ne = ['0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣'];
         await message.react(value <= 9 ? ne[value] : '✅').catch(() => {});
         if (value % 100 === 0) await message.channel.send({ embeds: [E('#00cc88', `🎉 ${value} reached!`).setDescription(`The count hit **${value}** thanks to <@${message.author.id}>!`)] }).catch(() => {});
@@ -575,7 +575,7 @@ client.on('messageCreate', async message => {
     saveState(gid, state);
 
     const earnedSave = value % 50 === 0;
-    await updateUserStat(gid, message.author.id, { correct: 1 });
+    updateUserStat(gid, message.author.id, { correct: 1 }); // fire-and-forget
     if (earnedSave) {
         state.saves = (state.saves ?? 0) + 1;
         saveState(gid, state);
