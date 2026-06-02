@@ -164,14 +164,8 @@ async function buildGlobalUsersEmbed(page) {
     const { rows, total } = await getGlobalUsersPage(page);
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
     if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Users').setDescription('No stats yet!'), totalPages: 1 };
-    const userLines = await Promise.all(rows.map(async (r, i) => {
-        let name;
-        try { const u = client.users.cache.get(r.user_id) ?? await client.users.fetch(r.user_id).catch(() => null); name = u ? `@${u.username}` : `<@${r.user_id}>`; }
-        catch { name = `<@${r.user_id}>`; }
-        return `${M[off + i] ?? `**${off + i + 1}.**`} ${name} — **${parseInt(r.correct)}** counts`;
-    }));
     return { totalPages: tp, embed: E('#5865F2', '🌍 Global Leaderboard — Users')
-        .setDescription(userLines.join('\n'))
+        .setDescription(rows.map((r, i) => `${M[off + i] ?? `**${off + i + 1}.**`} <@${r.user_id}> — **${parseInt(r.correct)}** counts`).join('\n'))
         .setFooter({ text: `Page ${page}/${tp} · ${off + 1}–${off + rows.length} of ${total} users` }) };
 }
 async function buildGlobalServersEmbed(page, filter = 'all') {
@@ -906,4 +900,3 @@ client.login(process.env.DISCORD_TOKEN);
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => { const ok = req.url === '/' || req.url === '/health'; res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' }); res.end(ok ? 'Counting bot running!' : 'Not found'); }).listen(PORT, () => console.log(`HTTP on port ${PORT}`));
-
