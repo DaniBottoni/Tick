@@ -84,11 +84,14 @@ async function getGlobalUsersPage(page) {
     ]);
     return { rows: rows.rows, total: parseInt(tot.rows[0].cnt) };
 }
-async function getGlobalServersPage(page) {
+async function getGlobalServersPage(page, filter = 'all') {
     const off = (page - 1) * PS;
+    const where = filter === 'interactive' ? `WHERE COALESCE(data->>'countType','interactive')='interactive'`
+                : filter === 'simple'      ? `WHERE data->>'countType'='simple'`
+                : '';
     const [rows, tot] = await Promise.all([
-        pool.query(`SELECT guild_id, COALESCE((data->>'current')::int,0) AS cur, COALESCE((data->>'highScore')::int,0) AS hs FROM counting ORDER BY cur DESC LIMIT $1 OFFSET $2`, [PS, off]),
-        pool.query(`SELECT COUNT(*) AS cnt FROM counting`),
+        pool.query(`SELECT guild_id, COALESCE((data->>'current')::int,0) AS cur, COALESCE((data->>'highScore')::int,0) AS hs, COALESCE(data->>'countType','interactive') AS mode FROM counting ${where} ORDER BY cur DESC LIMIT $1 OFFSET $2`, [PS, off]),
+        pool.query(`SELECT COUNT(*) AS cnt FROM counting ${where}`),
     ]);
     return { rows: rows.rows, total: parseInt(tot.rows[0].cnt) };
 }
@@ -106,9 +109,15 @@ const M = ['🥇', '🥈', '🥉'];
 const E = (color, title) => new EmbedBuilder().setColor(color).setTitle(title);
 const ep = () => ({ flags: [MessageFlags.Ephemeral] });
 
+const guildNameCache = new Map();
 async function guildName(id) {
-    try { const g = client.guilds.cache.get(id) ?? await client.guilds.fetch(id).catch(() => null); return g ? g.name : `Server ${id}`; }
-    catch { return `Server ${id}`; }
+    if (guildNameCache.has(id)) return guildNameCache.get(id);
+    try {
+        const g = client.guilds.cache.get(id) ?? await client.guilds.fetch(id).catch(() => null);
+        const name = g ? g.name : null;
+        if (name) { guildNameCache.set(id, name); return name; }
+    } catch {}
+    return `Unknown Server`; // don't expose raw IDs to users
 }
 async function hasPerm(interaction, guildId) {
     if (interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return true;
@@ -155,23 +164,34 @@ async function buildGlobalUsersEmbed(page) {
     const { rows, total } = await getGlobalUsersPage(page);
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
     if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Users').setDescription('No stats yet!'), totalPages: 1 };
+    const userLines = await Promise.all(rows.map(async (r, i) => {
+        let name;
+        try { const u = client.users.cache.get(r.user_id) ?? await client.users.fetch(r.user_id).catch(() => null); name = u ? `@${u.username}` : `<@${r.user_id}>`; }
+        catch { name = `<@${r.user_id}>`; }
+        return `${M[off + i] ?? `**${off + i + 1}.**`} ${name} — **${parseInt(r.correct)}** counts`;
+    }));
     return { totalPages: tp, embed: E('#5865F2', '🌍 Global Leaderboard — Users')
-        .setDescription(rows.map((r, i) => `${M[off + i] ?? `**${off + i + 1}.**`} <@${r.user_id}> — **${parseInt(r.correct)}** counts`).join('\n'))
+        .setDescription(userLines.join('\n'))
         .setFooter({ text: `Page ${page}/${tp} · ${off + 1}–${off + rows.length} of ${total} users` }) };
 }
-async function buildGlobalServersEmbed(page) {
-    const { rows, total } = await getGlobalServersPage(page);
+async function buildGlobalServersEmbed(page, filter = 'all') {
+    const { rows, total } = await getGlobalServersPage(page, filter);
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
-    if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Servers').setDescription('No stats yet!'), totalPages: 1 };
-    const lines = await Promise.all(rows.map(async (r, i) => { const gs = await getState(r.guild_id); const mode = (gs.countType ?? 'interactive') === 'simple' ? '🟢' : '🎮'; return `${M[off + i] ?? `**${off + i + 1}.**`} **${await guildName(r.guild_id)}** ${mode} — 🔢 **${r.cur}**`; }));
-    return { totalPages: tp, embed: E('#5865F2', '🌍 Global Leaderboard — Servers').setDescription(lines.join('\n')).setFooter({ text: `Page ${page}/${tp} · 🎮 Interactive · 🟢 Simple · ranked by current count` }) };
+    if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Servers').setDescription('No servers found!'), totalPages: 1, filter };
+    const lines = await Promise.all(rows.map(async (r, i) => {
+        const mode = r.mode === 'simple' ? '🟢' : '🎮';
+        const name = await guildName(r.guild_id);
+        return `${M[off + i] ?? `**${off + i + 1}.**`} **${name}** ${mode} — 🔢 **${r.cur}**`;
+    }));
+    const filterLabel = filter === 'interactive' ? '🎮 Interactive only' : filter === 'simple' ? '🟢 Simple only' : '🎮 Interactive · 🟢 Simple';
+    return { totalPages: tp, filter, embed: E('#5865F2', '🌍 Global Leaderboard — Servers').setDescription(lines.join('\n')).setFooter({ text: `Page ${page}/${tp} · ${filterLabel}` }) };
 }
 async function buildHighscoresEmbed(page) {
     const { rows, total } = await getHighscoresPage(page);
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
     if (!rows.length) return { embed: E('#5865F2', '🏅 High Score Leaderboard').setDescription('No data yet!'), totalPages: 1 };
-    const lines = await Promise.all(rows.map(async (r, i) => { const gs = await getState(r.guild_id); const mode = (gs.countType ?? 'interactive') === 'simple' ? '🟢' : '🎮'; return `${M[off + i] ?? `**${off + i + 1}.**`} **${await guildName(r.guild_id)}** ${mode} — 🏆 **${r.hs}** · 🔢 ${r.cur}`; }));
-    return { totalPages: tp, embed: E('#5865F2', '🏅 All-Time High Score Leaderboard').setDescription(lines.join('\n')).setFooter({ text: `Page ${page}/${tp} · ranked by all-time high score` }) };
+    const lines = await Promise.all(rows.map(async (r, i) => `${M[off + i] ?? `**${off + i + 1}.**`} **${await guildName(r.guild_id)}** — 🏆 **${r.hs}**`));
+    return { totalPages: tp, embed: E('#5865F2', '🏅 All-Time High Score Leaderboard').setDescription(lines.join('\n')).setFooter({ text: `Page ${page}/${tp}` }) };
 }
 
 // Setup embed 
@@ -221,6 +241,13 @@ function paginationRow(type, ctx, page, tp) {
 }
 function globalTabRow(active) {
     return new ActionRowBuilder().addComponents(B('lbt_gu', 'Users', active === 'gu'), B('lbt_gs', 'Servers', active === 'gs'));
+}
+function serverFilterRow(filter) {
+    return new ActionRowBuilder().addComponents(
+        B('gsf_all',         'All',           filter === 'all'),
+        B('gsf_interactive', '🎮 Interactive', filter === 'interactive'),
+        B('gsf_simple',      '🟢 Simple',      filter === 'simple'),
+    );
 }
 function countTypeRow(current) {
     return new ActionRowBuilder().addComponents(
@@ -690,11 +717,37 @@ client.on('interactionCreate', async interaction => {
             } catch (e) { console.error('stats btn:', e); return interaction.editReply({ content: 'Failed to load stats.' }); }
         }
 
+        if (id.startsWith('gsf_')) {
+            await interaction.deferUpdate();
+            try {
+                const filter = id.slice(4); // 'all', 'interactive', 'simple'
+                const r = await buildGlobalServersEmbed(1, filter);
+                const base = `lb_gs_f${filter}`;
+                const pRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`${base}_p0`).setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(true),
+                    new ButtonBuilder().setCustomId(`${base}_info`).setLabel(`1/${r.totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+                    new ButtonBuilder().setCustomId(`${base}_p2`).setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(r.totalPages <= 1),
+                    new ButtonBuilder().setCustomId(`${base}_p1`).setLabel('↺').setStyle(ButtonStyle.Secondary),
+                );
+                return interaction.editReply({ embeds: [r.embed], components: [globalTabRow('gs'), serverFilterRow(filter), pRow] });
+            } catch (e) { console.error('gsf btn:', e); await interaction.editReply({ content: '❌ Failed.' }).catch(() => {}); }
+        }
+
         if (id === 'lbt_gu' || id === 'lbt_gs') {
             await interaction.deferUpdate();
             try {
                 if (id === 'lbt_gu') { const { embed, totalPages } = await buildGlobalUsersEmbed(1);   return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, totalPages)] }); }
-                if (id === 'lbt_gs') { const { embed, totalPages } = await buildGlobalServersEmbed(1); return interaction.editReply({ embeds: [embed], components: [globalTabRow('gs'), paginationRow('gs', '', 1, totalPages)] }); }
+                if (id === 'lbt_gs') {
+                    const r = await buildGlobalServersEmbed(1, 'all');
+                    const base = 'lb_gs_fall';
+                    const pRow = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`${base}_p0`).setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(true),
+                        new ButtonBuilder().setCustomId(`${base}_info`).setLabel(`1/${r.totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+                        new ButtonBuilder().setCustomId(`${base}_p2`).setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(r.totalPages <= 1),
+                        new ButtonBuilder().setCustomId(`${base}_p1`).setLabel('↺').setStyle(ButtonStyle.Secondary),
+                    );
+                    return interaction.editReply({ embeds: [r.embed], components: [globalTabRow('gs'), serverFilterRow('all'), pRow] });
+                }
             } catch (e) { console.error('tab btn:', e); await interaction.editReply({ content: 'Failed to load.' }).catch(() => {}); }
         }
 
@@ -707,7 +760,19 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferUpdate();
             try {
                 if (type === 'gu') { const { embed, totalPages } = await buildGlobalUsersEmbed(page);   return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', page, totalPages)] }); }
-                if (type === 'gs') { const { embed, totalPages } = await buildGlobalServersEmbed(page); return interaction.editReply({ embeds: [embed], components: [globalTabRow('gs'), paginationRow('gs', '', page, totalPages)] }); }
+                if (type === 'gs') {
+                    // customId: lb_gs_f{filter}_p{page}
+                    const filterSeg = id.split('_').find(s => s.startsWith('f'));
+                    const filter = filterSeg ? filterSeg.slice(1) : 'all';
+                    const r = await buildGlobalServersEmbed(page, filter);
+                    const pRow = (() => { const base = `lb_gs_f${filter}`; return new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`${base}_p${page-1}`).setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(page<=1),
+                        new ButtonBuilder().setCustomId(`${base}_info`).setLabel(`${page}/${r.totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+                        new ButtonBuilder().setCustomId(`${base}_p${page+1}`).setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(page>=r.totalPages),
+                        new ButtonBuilder().setCustomId(`${base}_p${page}`).setLabel('↺').setStyle(ButtonStyle.Secondary),
+                    ); })();
+                    return interaction.editReply({ embeds: [r.embed], components: [globalTabRow('gs'), serverFilterRow(filter), pRow] });
+                }
                 if (type === 'hs') { const { embed, totalPages } = await buildHighscoresEmbed(page);    return interaction.editReply({ embeds: [embed], components: [paginationRow('hs', '', page, totalPages)] }); }
                 if (type === 'sv') { const svgid = id.split('_')[2]; const { embed, totalPages } = await buildServerLbEmbed(svgid, page); return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', svgid, page, totalPages)] }); }
             } catch (e) { console.error('lb btn:', e); await interaction.editReply({ content: 'Failed to load. Try again.' }).catch(() => {}); }
@@ -771,7 +836,7 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferReply(ep());
             const sub = options.getSubcommand();
             if (sub === 'server')     { const { embed, totalPages } = await buildServerLbEmbed(gid, 1);  return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', gid, 1, totalPages)] }); }
-            if (sub === 'global')     { const { embed, totalPages } = await buildGlobalUsersEmbed(1);    return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, totalPages)] }); }
+            if (sub === 'global')     { const r = await buildGlobalUsersEmbed(1); return interaction.editReply({ embeds: [r.embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, r.totalPages)] }); }
             if (sub === 'highscores') { const { embed, totalPages } = await buildHighscoresEmbed(1);     return interaction.editReply({ embeds: [embed], components: [paginationRow('hs', '', 1, totalPages)] }); }
         }
 
