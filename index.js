@@ -165,18 +165,12 @@ async function buildGlobalUsersEmbed(page) {
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
     if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Users').setDescription('No stats yet!'), totalPages: 1 };
     const userLines = await Promise.all(rows.map(async (r, i) => {
-        // Use mention if we share a server, otherwise fetch and show plain @username
-        const inCache = client.guilds.cache.some(g => g.members.cache.has(r.user_id));
         let display;
-        if (inCache) {
+        try {
+            const u = await client.users.fetch(r.user_id);
+            display = `<@${u.id}> (@${u.username})`;
+        } catch {
             display = `<@${r.user_id}>`;
-        } else {
-            try {
-                const u = await client.users.fetch(r.user_id);
-                display = `@${u.username}`;
-            } catch {
-                display = `<@${r.user_id}>`;
-            }
         }
         return `${M[off + i] ?? `**${off + i + 1}.**`} ${display} — **${parseInt(r.correct)}** counts`;
     }));
