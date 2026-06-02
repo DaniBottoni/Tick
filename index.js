@@ -164,8 +164,24 @@ async function buildGlobalUsersEmbed(page) {
     const { rows, total } = await getGlobalUsersPage(page);
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
     if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Users').setDescription('No stats yet!'), totalPages: 1 };
+    const userLines = await Promise.all(rows.map(async (r, i) => {
+        // Use mention if we share a server, otherwise fetch and show plain @username
+        const inCache = client.guilds.cache.some(g => g.members.cache.has(r.user_id));
+        let display;
+        if (inCache) {
+            display = `<@${r.user_id}>`;
+        } else {
+            try {
+                const u = await client.users.fetch(r.user_id);
+                display = `@${u.username}`;
+            } catch {
+                display = `<@${r.user_id}>`;
+            }
+        }
+        return `${M[off + i] ?? `**${off + i + 1}.**`} ${display} — **${parseInt(r.correct)}** counts`;
+    }));
     return { totalPages: tp, embed: E('#5865F2', '🌍 Global Leaderboard — Users')
-        .setDescription(rows.map((r, i) => `${M[off + i] ?? `**${off + i + 1}.**`} <@${r.user_id}> — **${parseInt(r.correct)}** counts`).join('\n'))
+        .setDescription(userLines.join('\n'))
         .setFooter({ text: `Page ${page}/${tp} · ${off + 1}–${off + rows.length} of ${total} users` }) };
 }
 async function buildGlobalServersEmbed(page, filter = 'all') {
