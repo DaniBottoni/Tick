@@ -111,13 +111,18 @@ const ep = () => ({ flags: [MessageFlags.Ephemeral] });
 
 const guildNameCache = new Map();
 async function guildName(id) {
+    // If bot is no longer in the guild, treat as unknown regardless of cache
+    if (!client.guilds.cache.has(id)) {
+        guildNameCache.delete(id); // clear stale cache
+        return null; // signals "unknown"
+    }
     if (guildNameCache.has(id)) return guildNameCache.get(id);
     try {
         const g = client.guilds.cache.get(id) ?? await client.guilds.fetch(id).catch(() => null);
         const name = g ? g.name : null;
         if (name) { guildNameCache.set(id, name); return name; }
     } catch {}
-    return `Unknown Server`; // don't expose raw IDs to users
+    return null;
 }
 async function hasPerm(interaction, guildId) {
     if (interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return true;
@@ -182,20 +187,27 @@ async function buildGlobalServersEmbed(page, filter = 'all') {
     const { rows, total } = await getGlobalServersPage(page, filter);
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
     if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Servers').setDescription('No servers found!'), totalPages: 1, filter };
-    const lines = await Promise.all(rows.map(async (r, i) => {
-        const mode = r.mode === 'simple' ? '🟢' : '🎮';
+    const resolved = (await Promise.all(rows.map(async (r, i) => {
         const name = await guildName(r.guild_id);
+        if (!name) return null;
+        const mode = r.mode === 'simple' ? '🟢' : '🎮';
         return `${M[off + i] ?? `**${off + i + 1}.**`} **${name}** ${mode} — 🔢 **${r.cur}**`;
-    }));
+    }))).filter(Boolean);
+    if (!resolved.length) return { embed: E('#5865F2', '🌍 Global — Servers').setDescription('No active servers found!'), totalPages: 1, filter };
     const filterLabel = filter === 'interactive' ? '🎮 Interactive only' : filter === 'simple' ? '🟢 Simple only' : '🎮 Interactive · 🟢 Simple';
-    return { totalPages: tp, filter, embed: E('#5865F2', '🌍 Global Leaderboard — Servers').setDescription(lines.join('\n')).setFooter({ text: `Page ${page}/${tp} · ${filterLabel}` }) };
+    return { totalPages: tp, filter, embed: E('#5865F2', '🌍 Global Leaderboard — Servers').setDescription(resolved.join('\n')).setFooter({ text: `Page ${page}/${tp} · ${filterLabel}` }) };
 }
 async function buildHighscoresEmbed(page) {
     const { rows, total } = await getHighscoresPage(page);
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
     if (!rows.length) return { embed: E('#5865F2', '🏅 High Score Leaderboard').setDescription('No data yet!'), totalPages: 1 };
-    const lines = await Promise.all(rows.map(async (r, i) => `${M[off + i] ?? `**${off + i + 1}.**`} **${await guildName(r.guild_id)}** — 🏆 **${r.hs}**`));
-    return { totalPages: tp, embed: E('#5865F2', '🏅 All-Time High Score Leaderboard').setDescription(lines.join('\n')).setFooter({ text: `Page ${page}/${tp}` }) };
+    const hsResolved = (await Promise.all(rows.map(async (r, i) => {
+        const name = await guildName(r.guild_id);
+        if (!name) return null;
+        return `${M[off + i] ?? `**${off + i + 1}.**`} **${name}** — 🏆 **${r.hs}**`;
+    }))).filter(Boolean);
+    if (!hsResolved.length) return { embed: E('#5865F2', '🏅 High Score Leaderboard').setDescription('No active servers found!'), totalPages: 1 };
+    return { totalPages: tp, embed: E('#5865F2', '🏅 All-Time High Score Leaderboard').setDescription(hsResolved.join('\n')).setFooter({ text: `Page ${page}/${tp}` }) };
 }
 
 // Setup embed 
@@ -306,6 +318,7 @@ function safeMath(expr) {
         } else norm += s[k];
     }
     s = norm.replace(/[×·•]/g, '*').replace(/÷/g, '/').replace(/−/g, '-').replace(/\s+/g, '').toLowerCase();
+    s = s.replace(/(?<=[\d)])x(?=[\d(])/g, '*'); // 5x4 → 5*4
     s = s.replace(/\*\*/g, '^'); // ** acts as power
     s = s.replace(/(\d+)√/g, (_, n) => `nrt${n}(`);
     s = s.replace(/∜/g, 'nrt4(').replace(/∛/g, 'cbrt(').replace(/√/g, 'sqrt(');
