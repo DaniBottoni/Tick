@@ -711,7 +711,7 @@ client.on('interactionCreate', async interaction => {
                 saveState(btnGid, state);
                 await updateUserStat(btnGid, ownerId, { savesUsed: 1 });
                 return interaction.update({
-                    embeds: [E('#00cc88', '🛡️ Save used!').setDescription(`<@${ownerId}> used a **Save** — count stays at **${prevCount}**!`).addFields({ name: 'Remaining', value: `**${state.saves}**`, inline: true }, { name: 'Continues at', value: `**${prevCount}**`, inline: true })],
+                    embeds: [E('#00cc88', '🛡️ Save used!').setDescription(`<@${ownerId}> used a **Save** — count stays at **${prevCount}**!`).addFields({ name: 'Remaining', value: `**${state.saves}**`, inline: true }, { name: "Next number", value: `**${prevCount + 1}**`, inline: true })],
                     components: [],
                 });
             } else {
