@@ -513,10 +513,10 @@ function keepAlive() {
     setTimeout(ping, 5000); setInterval(ping, 14 * 60 * 1000);
 }
 
-// Ready 
+//  
 client.once('ready', async () => {
     console.log(`Online as ${client.user.tag}`);
-    client.user.setPresence({ activities: [{ name: 'Counting things', type: ActivityType.Watching }], status: 'online' });
+    client.user.setPresence({ activities: [{ name: 'Now with pride support!', type: ActivityType.Watching }], status: 'online' });
     const cmds = [
         new SlashCommandBuilder().setName('counting').setDescription('Configure or view the counting game')
             .addSubcommand(s => s.setName('reset').setDescription('Manually reset the count')),
