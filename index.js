@@ -697,6 +697,25 @@ function doReset(guildId, state, userId) {
     saveState(guildId, state);
     updateUserStat(guildId, userId, { ruined: 1 });
 }
+
+// Resets count when switching modes, announces in channel if set
+function resetOnModeSwitch(guildId, state, newType, guild) {
+    const mod = newType === 'random' ? pickRandomModifier() : null;
+    if (mod) { state.randomModifier = mod.id; state.randomModifierLabel = mod.label; }
+    state.current = newType === 'countdown' ? (state.countdownStart ?? 100) : 0;
+    state.lastUserId = null;
+    state.consecutiveCount = 0;
+    delete state.pendingSave;
+    saveState(guildId, state);
+    if (state.channelId && guild) {
+        const ch = guild.channels.cache.get(state.channelId);
+        if (ch) {
+            const startFrom = newType === 'countdown' ? state.countdownStart ?? 100 : 1;
+            const modNote = mod ? `\nModifier: **${mod.label}**` : '';
+            ch.send({ embeds: [E('#ff9900', `${MODE_EMOJI[newType]} Switched to ${MODE_LABEL[newType]} mode`).setDescription(`Count reset. Start again from **${startFrom}**!${modNote}`)] }).catch(() => {});
+        }
+    }
+}
 async function triggerRuin(channel, guildId, state, userId, reason) {
     const prev = state.current;
     const expiresAt = Date.now() + 60_000;
@@ -720,12 +739,14 @@ async function triggerRuin(channel, guildId, state, userId, reason) {
             const fresh = await getState(guildId);
             if (!fresh.pendingSave || fresh.pendingSave.expiresAt !== expiresAt) return;
             doReset(guildId, fresh, userId);
-            await prompt.edit({ embeds: [E('#ff4444', '💥 Save expired!').setDescription(`<@${userId}> didn't use their save in time. Count resets!`)], components: [] }).catch(() => {});
+            const expiredModNote = fresh.countType === 'random' ? `\nNew modifier: **${fresh.randomModifierLabel}**` : '';
+            await prompt.edit({ embeds: [E('#ff4444', '💥 Save expired!').setDescription(`<@${userId}> didn't use their save in time. Count resets!${expiredModNote}`)], components: [] }).catch(() => {});
         }, 60_000);
     } else {
         doReset(guildId, state, userId);
         const resetTo = state.countType === 'countdown' ? (state.countdownStart ?? 100) : 1;
-        await channel.send({ embeds: [E('#ff4444', '💥 Count ruined!').setDescription(`<@${userId}> ruined the count! (${reason})\nCount was at **${prev}**.`).addFields({ name: 'Reset to', value: `**${resetTo}**`, inline: true }, { name: 'High Score', value: `**${state.highScore}**`, inline: true }).setFooter({ text: `Start again from ${resetTo}!` })] }).catch(e => console.error('ruin msg failed:', e.message));
+        const ruinModNote = state.countType === 'random' ? `\nNew modifier: **${state.randomModifierLabel}**` : '';
+        await channel.send({ embeds: [E('#ff4444', '💥 Count ruined!').setDescription(`<@${userId}> ruined the count! (${reason})\nCount was at **${prev}**.${ruinModNote}`).addFields({ name: 'Reset to', value: `**${resetTo}**`, inline: true }, { name: 'High Score', value: `**${state.highScore}**`, inline: true }).setFooter({ text: `Start again from ${resetTo}!` })] }).catch(e => console.error('ruin msg failed:', e.message));
     }
 }
 
@@ -997,14 +1018,8 @@ client.on('interactionCreate', async interaction => {
                 // cycle through modes
                 const cycle = { interactive: 'simple', simple: 'countdown', countdown: 'random', random: 'interactive' };
                 state.countType = cycle[state.countType ?? 'interactive'] ?? 'interactive';
-                // Initialize countdown/random state if needed
-                if (state.countType === 'countdown' && !state.current) state.current = state.countdownStart ?? 100;
-                if (state.countType === 'random' && !state.randomModifier) {
-                    const mod = pickRandomModifier();
-                    state.randomModifier = mod.id;
-                    state.randomModifierLabel = mod.label;
-                }
-                saveState(gid, state); return interaction.update(buildSetupEmbed(state));
+                resetOnModeSwitch(gid, state, state.countType, interaction.guild);
+                return interaction.update(buildSetupEmbed(state));
             }
             if (id === 'setup_expressions') {
                 state.allowExpressions = !state.allowExpressions;
@@ -1037,16 +1052,7 @@ client.on('interactionCreate', async interaction => {
             const state = await getState(gid);
             const newType = id.slice(3); // 'interactive' | 'simple' | 'countdown' | 'random'
             state.countType = newType;
-            if (newType === 'countdown' && (!state.current || state.current > (state.countdownStart ?? 100))) {
-                state.current = state.countdownStart ?? 100;
-                state.lastUserId = null; state.consecutiveCount = 0;
-            }
-            if (newType === 'random' && !state.randomModifier) {
-                const mod = pickRandomModifier();
-                state.randomModifier = mod.id;
-                state.randomModifierLabel = mod.label;
-            }
-            saveState(gid, state);
+            resetOnModeSwitch(gid, state, newType, interaction.guild);
             const descriptions = {
                 interactive: 'Back to **Interactive** mode. Wrong numbers and streaks will reset the count!',
                 simple:      '**Simple** mode enabled. Wrong messages are silently deleted.',
