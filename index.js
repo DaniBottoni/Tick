@@ -10,7 +10,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejec
 const stateCache = new Map();
 const PS = 25, SLB_MAX = 100;
 
-// DB 
+// ─── DB ───────────────────────────────────────────────────────────────────────
 async function initDB() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS counting   (guild_id TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
@@ -29,7 +29,15 @@ async function claimMessage(messageId) {
 }
 
 function defaultState() {
-    return { channelId: null, current: 0, lastUserId: null, consecutiveCount: 0, maxStreak: 1, allowExpressions: true, highScore: 0, accessRoleId: null, countType: 'interactive', saves: 0, savesUsed: 0 };
+    return {
+        channelId: null, current: 0, lastUserId: null, consecutiveCount: 0,
+        maxStreak: 1, allowExpressions: true, highScore: 0, accessRoleId: null,
+        countType: 'interactive', saves: 0, savesUsed: 0,
+        // Countdown extras
+        countdownCycles: 0, countdownStart: 100,
+        // Random extras
+        randomModifier: null, randomModifierLabel: null, randomModifierStep: null,
+    };
 }
 async function getState(guildId) {
     if (stateCache.has(guildId)) return stateCache.get(guildId);
@@ -44,7 +52,7 @@ function saveState(guildId, data) {
     pool.query('INSERT INTO counting (guild_id,data) VALUES ($1,$2) ON CONFLICT (guild_id) DO UPDATE SET data=$2', [guildId, data]).catch(e => console.error('saveState:', e.message));
 }
 
-// Stats 
+// ─── Stats ────────────────────────────────────────────────────────────────────
 async function updateUserStat(guildId, userId, delta) {
     try {
         const r = await pool.query('SELECT data FROM user_stats WHERE guild_id=$1 AND user_id=$2', [guildId, userId]);
@@ -67,7 +75,7 @@ async function getServerStats(gid) {
     return r.rows[0] ?? {};
 }
 
-// Paginated queries 
+// ─── Paginated queries ────────────────────────────────────────────────────────
 async function getServerLbPage(gid, page) {
     const off = Math.min((page - 1) * PS, SLB_MAX - PS);
     const [rows, tot] = await Promise.all([
@@ -84,38 +92,49 @@ async function getGlobalUsersPage(page) {
     ]);
     return { rows: rows.rows, total: parseInt(tot.rows[0].cnt) };
 }
-async function getGlobalServersPage(page, filter = 'all') {
+async function getGlobalServersPage(page, filter) {
+    // filter: 'interactive' | 'simple' | 'countdown' | 'random'
     const off = (page - 1) * PS;
-    const where = filter === 'interactive' ? `WHERE COALESCE(data->>'countType','interactive')='interactive'`
-                : filter === 'simple'      ? `WHERE data->>'countType'='simple'`
-                : '';
+    const where = filter ? `WHERE COALESCE(data->>'countType','interactive')='${filter}'` : '';
     const [rows, tot] = await Promise.all([
         pool.query(`SELECT guild_id, COALESCE((data->>'current')::int,0) AS cur, COALESCE((data->>'highScore')::int,0) AS hs, COALESCE(data->>'countType','interactive') AS mode FROM counting ${where} ORDER BY cur DESC LIMIT $1 OFFSET $2`, [PS, off]),
         pool.query(`SELECT COUNT(*) AS cnt FROM counting ${where}`),
     ]);
     return { rows: rows.rows, total: parseInt(tot.rows[0].cnt) };
 }
-async function getHighscoresPage(page) {
+async function getHighscoresPage(page, filter) {
+    // filter: 'interactive' | 'simple' | 'countdown' | 'random' | undefined (all non-countdown)
     const off = (page - 1) * PS;
+    // Countdown uses cycles; others use highScore
+    let where = '';
+    if (filter === 'countdown') {
+        where = `WHERE COALESCE(data->>'countType','interactive')='countdown'`;
+    } else if (filter) {
+        where = `WHERE COALESCE(data->>'countType','interactive')='${filter}'`;
+    } else {
+        where = `WHERE COALESCE(data->>'countType','interactive') != 'countdown'`;
+    }
+    const scoreExpr = filter === 'countdown'
+        ? `COALESCE((data->>'countdownCycles')::int,0)`
+        : `COALESCE((data->>'highScore')::int,0)`;
     const [rows, tot] = await Promise.all([
-        pool.query(`SELECT guild_id, COALESCE((data->>'highScore')::int,0) AS hs, COALESCE((data->>'current')::int,0) AS cur FROM counting ORDER BY hs DESC LIMIT $1 OFFSET $2`, [PS, off]),
-        pool.query(`SELECT COUNT(*) AS cnt FROM counting`),
+        pool.query(`SELECT guild_id, ${scoreExpr} AS score, COALESCE((data->>'current')::int,0) AS cur, COALESCE(data->>'countType','interactive') AS mode FROM counting ${where} ORDER BY score DESC LIMIT $1 OFFSET $2`, [PS, off]),
+        pool.query(`SELECT COUNT(*) AS cnt FROM counting ${where}`),
     ]);
     return { rows: rows.rows, total: parseInt(tot.rows[0].cnt) };
 }
 
-// Helpers 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 const M = ['🥇', '🥈', '🥉'];
 const E = (color, title) => new EmbedBuilder().setColor(color).setTitle(title);
 const ep = () => ({ flags: [MessageFlags.Ephemeral] });
 
+const MODE_EMOJI = { interactive: '🎮', simple: '🟢', countdown: '⏳', random: '🎲' };
+const MODE_LABEL = { interactive: 'Interactive', simple: 'Simple', countdown: 'Countdown', random: 'Random' };
+
 const guildNameCache = new Map();
 async function guildName(id) {
-    // If bot is no longer in the guild, treat as unknown regardless of cache
-    if (!client.guilds.cache.has(id)) {
-        guildNameCache.delete(id); // clear stale cache
-        return null; // signals "unknown"
-    }
+    if (!client.guilds.cache.has(id)) { guildNameCache.delete(id); return null; }
     if (guildNameCache.has(id)) return guildNameCache.get(id);
     try {
         const g = client.guilds.cache.get(id) ?? await client.guilds.fetch(id).catch(() => null);
@@ -130,10 +149,129 @@ async function hasPerm(interaction, guildId) {
     return s.accessRoleId ? interaction.member.roles.cache.has(s.accessRoleId) : false;
 }
 
-// Embed builders 
+// ─── Random Modifier System ───────────────────────────────────────────────────
+const RANDOM_MODIFIERS = [
+    {
+        id: 'every2',
+        label: '⏩ Count every 2nd number',
+        desc: 'Skip every other number! Only even numbers count.',
+        check: (n) => n % 2 === 0,
+        next: (current) => current + 2,
+        hint: (current) => `Next: **${current + 2}**`,
+    },
+    {
+        id: 'every3',
+        label: '⏩ Count every 3rd number',
+        desc: 'Only multiples of 3!',
+        check: (n) => n % 3 === 0,
+        next: (current) => current + 3,
+        hint: (current) => `Next: **${current + 3}**`,
+    },
+    {
+        id: 'primes',
+        label: '🔢 Primes only',
+        desc: 'Only prime numbers are valid!',
+        check: (n) => isPrime(n),
+        next: (current) => nextPrime(current),
+        hint: (current) => `Next prime: **${nextPrime(current)}**`,
+    },
+    {
+        id: 'fibonacci',
+        label: '🌀 Fibonacci sequence',
+        desc: 'Follow the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13…',
+        check: (n) => isFibonacci(n),
+        next: (current) => nextFibonacci(current),
+        hint: (current) => `Next Fibonacci: **${nextFibonacci(current)}**`,
+    },
+    {
+        id: 'squares',
+        label: '🟥 Perfect squares',
+        desc: 'Only perfect squares! 1, 4, 9, 16, 25…',
+        check: (n) => { const s = Math.round(Math.sqrt(n)); return s * s === n; },
+        next: (current) => { const s = Math.round(Math.sqrt(current)); return (s + 1) * (s + 1); },
+        hint: (current) => { const s = Math.round(Math.sqrt(current)); return `Next square: **${(s + 1) * (s + 1)}**`; },
+    },
+    {
+        id: 'palindromes',
+        label: '🔄 Palindrome numbers',
+        desc: 'Only numbers that read the same forwards and backwards! 1, 2, …, 9, 11, 22, 33…',
+        check: (n) => { const s = String(n); return s === s.split('').reverse().join(''); },
+        next: (current) => { let n = current + 1; while (true) { const s = String(n); if (s === s.split('').reverse().join('')) return n; n++; } },
+        hint: (current) => { let n = current + 1; while (true) { const s = String(n); if (s === s.split('').reverse().join('')) return `Next palindrome: **${n}**`; n++; } },
+    },
+    {
+        id: 'lucky7',
+        label: '🍀 Multiples of 7',
+        desc: 'Lucky sevens! Only multiples of 7.',
+        check: (n) => n % 7 === 0,
+        next: (current) => current + 7,
+        hint: (current) => `Next: **${current + 7}**`,
+    },
+    {
+        id: 'triangular',
+        label: '🔺 Triangular numbers',
+        desc: 'Only triangular numbers! 1, 3, 6, 10, 15, 21…',
+        check: (n) => isTriangular(n),
+        next: (current) => nextTriangular(current),
+        hint: (current) => `Next triangular: **${nextTriangular(current)}**`,
+    },
+];
+
+function isPrime(n) {
+    if (n < 2) return false;
+    if (n === 2) return true;
+    if (n % 2 === 0) return false;
+    for (let i = 3; i <= Math.sqrt(n); i += 2) if (n % i === 0) return false;
+    return true;
+}
+function nextPrime(n) {
+    let m = n + 1;
+    while (!isPrime(m)) m++;
+    return m;
+}
+function isFibonacci(n) {
+    const isPerfectSquare = x => { const s = Math.round(Math.sqrt(x)); return s * s === x; };
+    return isPerfectSquare(5 * n * n + 4) || isPerfectSquare(5 * n * n - 4);
+}
+function nextFibonacci(current) {
+    // find fib sequence up to and past current
+    let a = 1, b = 1;
+    while (b <= current) { const c = a + b; a = b; b = c; }
+    return b;
+}
+function isTriangular(n) {
+    const x = (Math.sqrt(8 * n + 1) - 1) / 2;
+    return Math.abs(x - Math.round(x)) < 1e-9;
+}
+function nextTriangular(n) {
+    let t = 1, k = 1;
+    while (t <= n) { k++; t = k * (k + 1) / 2; }
+    return t;
+}
+
+function pickRandomModifier() {
+    return RANDOM_MODIFIERS[Math.floor(Math.random() * RANDOM_MODIFIERS.length)];
+}
+function getModifier(id) {
+    return RANDOM_MODIFIERS.find(m => m.id === id) ?? RANDOM_MODIFIERS[0];
+}
+
+// For random mode: get the "first valid number" after a reset
+function firstValidForModifier(modId) {
+    const mod = getModifier(modId);
+    let n = 1;
+    while (!mod.check(n)) n++;
+    return n;
+}
+
+// ─── Embed builders ───────────────────────────────────────────────────────────
 async function buildUserStatsEmbed(gid, user) {
     const [st, rank, gs] = await Promise.all([getUserStats(gid, user.id), getUserRank(gid, user.id), getState(gid)]);
     const tot = (st.correct || 0) + (st.ruined || 0), acc = tot > 0 ? Math.round((st.correct / tot) * 100) : 100;
+    const modeEmoji = MODE_EMOJI[gs.countType ?? 'interactive'];
+    const extra = gs.countType === 'countdown'
+        ? [{ name: '⏳ Countdown Cycles', value: `**${gs.countdownCycles ?? 0}**`, inline: true }]
+        : [];
     return E('#5865F2', `📊 Stats — ${user.username}`).setThumbnail(user.displayAvatarURL()).addFields(
         { name: '✅ Correct',      value: `**${st.correct ?? 0}**`,  inline: true },
         { name: '💥 Ruined',       value: `**${st.ruined ?? 0}**`,   inline: true },
@@ -143,11 +281,21 @@ async function buildUserStatsEmbed(gid, user) {
         { name: '🏆 High score',   value: `**${gs.highScore}**`,     inline: true },
         { name: '🛡️ Server saves', value: `**${gs.saves ?? 0}**`,   inline: true },
         { name: '🔖 Saves used',   value: `**${gs.savesUsed ?? 0}**`, inline: true },
+        { name: `${modeEmoji} Mode`, value: `**${MODE_LABEL[gs.countType ?? 'interactive']}**`, inline: true },
+        ...extra,
     );
 }
 async function buildServerStatsEmbed(guild) {
     const [ss, gs] = await Promise.all([getServerStats(guild.id), getState(guild.id)]);
     const tc = parseInt(ss.tc) || 0, tr = parseInt(ss.tr) || 0, tu = parseInt(ss.tu) || 0, gt = tc + tr, ac = gt > 0 ? Math.round((tc / gt) * 100) : 100;
+    const modeEmoji = MODE_EMOJI[gs.countType ?? 'interactive'];
+    const extraFields = [];
+    if (gs.countType === 'countdown') {
+        extraFields.push({ name: '⏳ Cycles completed', value: `**${gs.countdownCycles ?? 0}**`, inline: true });
+    }
+    if (gs.countType === 'random' && gs.randomModifierLabel) {
+        extraFields.push({ name: '🎲 Current modifier', value: gs.randomModifierLabel, inline: true });
+    }
     return E('#5865F2', `📊 Server Stats — ${guild.name}`).setThumbnail(guild.iconURL()).addFields(
         { name: '👥 Counters',   value: `**${tu}**`,           inline: true },
         { name: '✅ Correct',    value: `**${tc}**`,           inline: true },
@@ -155,6 +303,8 @@ async function buildServerStatsEmbed(guild) {
         { name: '🎯 Accuracy',   value: `**${ac}%**`,          inline: true },
         { name: '🔢 Current',    value: `**${gs.current}**`,   inline: true },
         { name: '🏆 High score', value: `**${gs.highScore}**`, inline: true },
+        { name: `${modeEmoji} Mode`, value: `**${MODE_LABEL[gs.countType ?? 'interactive']}**`, inline: true },
+        ...extraFields,
     );
 }
 async function buildServerLbEmbed(gid, page) {
@@ -171,65 +321,86 @@ async function buildGlobalUsersEmbed(page) {
     if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Users').setDescription('No stats yet!'), totalPages: 1 };
     const userLines = await Promise.all(rows.map(async (r, i) => {
         let display;
-        try {
-            const u = await client.users.fetch(r.user_id);
-            display = `<@${u.id}> (@${u.username})`;
-        } catch {
-            display = `<@${r.user_id}>`;
-        }
+        try { const u = await client.users.fetch(r.user_id); display = `<@${u.id}> (@${u.username})`; }
+        catch { display = `<@${r.user_id}>`; }
         return `${M[off + i] ?? `**${off + i + 1}.**`} ${display} — **${parseInt(r.correct)}** counts`;
     }));
     return { totalPages: tp, embed: E('#5865F2', '🌍 Global Leaderboard — Users')
         .setDescription(userLines.join('\n'))
         .setFooter({ text: `Page ${page}/${tp} · ${off + 1}–${off + rows.length} of ${total} users` }) };
 }
-async function buildGlobalServersEmbed(page, filter = 'all') {
+
+// filter: 'interactive' | 'simple' | 'countdown' | 'random'
+async function buildGlobalServersEmbed(page, filter) {
     const { rows, total } = await getGlobalServersPage(page, filter);
     const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
-    if (!rows.length) return { embed: E('#5865F2', '🌍 Global — Servers').setDescription('No servers found!'), totalPages: 1, filter };
-    const resolved = (await Promise.all(rows.map(async (r, i) => {
+    const titles = {
+        interactive: '🎮 Global — Interactive Servers',
+        simple:      '🟢 Global — Simple Servers',
+        countdown:   '⏳ Global — Countdown Servers',
+        random:      '🎲 Global — Random Servers',
+    };
+    if (!rows.length) return { embed: E('#5865F2', titles[filter] ?? '🌍 Global — Servers').setDescription('No servers found!'), totalPages: 1, filter };
+    const resolved = (await Promise.all(rows.map(async r => {
         const name = await guildName(r.guild_id);
         if (!name) return null;
-        const mode = r.mode === 'simple' ? '🟢' : '🎮';
-        return `${M[off + i] ?? `**${off + i + 1}.**`} **${name}** ${mode} — 🔢 **${r.cur}**`;
-    }))).filter(Boolean);
-    if (!resolved.length) return { embed: E('#5865F2', '🌍 Global — Servers').setDescription('No active servers found!'), totalPages: 1, filter };
-    const filterLabel = filter === 'interactive' ? '🎮 Interactive only' : filter === 'simple' ? '🟢 Simple only' : '🎮 Interactive · 🟢 Simple';
-    return { totalPages: tp, filter, embed: E('#5865F2', '🌍 Global Leaderboard — Servers').setDescription(resolved.join('\n')).setFooter({ text: `Page ${page}/${tp} · ${filterLabel}` }) };
-}
-async function buildHighscoresEmbed(page) {
-    const { rows, total } = await getHighscoresPage(page);
-    const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
-    if (!rows.length) return { embed: E('#5865F2', '🏅 High Score Leaderboard').setDescription('No data yet!'), totalPages: 1 };
-    const hsResolved = (await Promise.all(rows.map(async (r, i) => {
-        const name = await guildName(r.guild_id);
-        if (!name) return null;
-        return `${M[off + i] ?? `**${off + i + 1}.**`} **${name}** — 🏆 **${r.hs}**`;
-    }))).filter(Boolean);
-    if (!hsResolved.length) return { embed: E('#5865F2', '🏅 High Score Leaderboard').setDescription('No active servers found!'), totalPages: 1 };
-    return { totalPages: tp, embed: E('#5865F2', '🏅 All-Time High Score Leaderboard').setDescription(hsResolved.join('\n')).setFooter({ text: `Page ${page}/${tp}` }) };
+        return { name, emoji: MODE_EMOJI[r.mode] ?? '🎮', cur: r.cur };
+    }))).filter(Boolean).map((r, i) => `${M[off + i] ?? `**${off + i + 1}.**`} **${r.name}** ${r.emoji} — 🔢 **${r.cur}**`);
+    if (!resolved.length) return { embed: E('#5865F2', titles[filter]).setDescription('No active servers found!'), totalPages: 1, filter };
+    return { totalPages: tp, filter, embed: E('#5865F2', titles[filter]).setDescription(resolved.join('\n')).setFooter({ text: `Page ${page}/${tp}` }) };
 }
 
-// Setup embed 
+// Highscores: filter = 'interactive'|'simple'|'random'|'countdown'
+async function buildHighscoresEmbed(page, filter = 'interactive') {
+    const { rows, total } = await getHighscoresPage(page, filter);
+    const tp = Math.max(1, Math.ceil(total / PS)), off = (page - 1) * PS;
+    const titles = {
+        interactive: '🏅 High Scores — Interactive',
+        simple:      '🏅 High Scores — Simple',
+        random:      '🏅 High Scores — Random',
+        countdown:   '🏅 High Scores — Countdown Cycles',
+    };
+    const scoreLabel = filter === 'countdown' ? 'cycles' : 'high score';
+    if (!rows.length) return { embed: E('#5865F2', titles[filter]).setDescription('No data yet!'), totalPages: 1 };
+    const hsResolved = (await Promise.all(rows.map(async r => {
+        const name = await guildName(r.guild_id);
+        if (!name) return null;
+        return { name, score: r.score };
+    }))).filter(Boolean).map((r, i) => {
+        const emoji = filter === 'countdown' ? '🔄' : '🏆';
+        return `${M[off + i] ?? `**${off + i + 1}.**`} **${r.name}** — ${emoji} **${r.score}** ${scoreLabel}`;
+    });
+    if (!hsResolved.length) return { embed: E('#5865F2', titles[filter]).setDescription('No active servers found!'), totalPages: 1 };
+    return { totalPages: tp, embed: E('#5865F2', titles[filter]).setDescription(hsResolved.join('\n')).setFooter({ text: `Page ${page}/${tp}` }) };
+}
+
+// ─── Setup embed ──────────────────────────────────────────────────────────────
 function buildSetupEmbed(state) {
     const ct = state.countType ?? 'interactive';
+    const modeDisplay = { interactive: '🎮 Interactive', simple: '🟢 Simple', countdown: '⏳ Countdown', random: '🎲 Random' }[ct] ?? '🎮 Interactive';
+    const extraField = ct === 'countdown'
+        ? [{ name: '⏳ Countdown Cycles', value: `**${state.countdownCycles ?? 0}**`, inline: true }]
+        : ct === 'random' && state.randomModifierLabel
+        ? [{ name: '🎲 Current Modifier', value: state.randomModifierLabel, inline: true }]
+        : [];
     return {
         embeds: [E('#5865F2', '⚙️ Counting Bot — Setup')
             .setDescription('Use the buttons below to configure the bot. All settings are saved instantly.')
             .addFields(
-                { name: '📍 Counting Channel', value: state.channelId ? `<#${state.channelId}>` : 'Not set',                              inline: true },
-                { name: '🎮 Count Type',        value: ct === 'interactive' ? '🎮 Interactive' : '🟢 Simple',                             inline: true },
-                { name: '🔁 Max Streak',        value: `**${state.maxStreak}** in a row`,                                                  inline: true },
-                { name: '🧮 Expressions',       value: state.allowExpressions ? 'Allowed' : 'Disabled',                                   inline: true },
-                { name: '🔒 Access Role',       value: state.accessRoleId ? `<@&${state.accessRoleId}>` : 'Admins only',                  inline: true },
-                { name: '🛡️ Server Saves',     value: `**${state.saves ?? 0}**`,                                                          inline: true },
-                { name: '🔢 Current Count',     value: `**${state.current}**`,                                                            inline: true },
+                { name: '📍 Counting Channel', value: state.channelId ? `<#${state.channelId}>` : 'Not set',             inline: true },
+                { name: '🎮 Count Type',        value: modeDisplay,                                                       inline: true },
+                { name: '🔁 Max Streak',        value: `**${state.maxStreak}** in a row`,                                 inline: true },
+                { name: '🧮 Expressions',       value: state.allowExpressions ? 'Allowed' : 'Disabled',                  inline: true },
+                { name: '🔒 Access Role',       value: state.accessRoleId ? `<@&${state.accessRoleId}>` : 'Admins only', inline: true },
+                { name: '🛡️ Server Saves',     value: `**${state.saves ?? 0}**`,                                         inline: true },
+                { name: '🔢 Current Count',     value: `**${state.current}**`,                                            inline: true },
+                ...extraField,
             )
         ],
         components: [
             new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('setup_setchannel').setLabel('Set Channel').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('setup_counttype').setLabel(ct === 'interactive' ? 'Switch to Simple' : 'Switch to Interactive').setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder().setCustomId('setup_counttype').setLabel('Change Mode').setStyle(ButtonStyle.Secondary),
                 new ButtonBuilder().setCustomId('setup_expressions').setLabel(state.allowExpressions ? 'Disable Expressions' : 'Enable Expressions').setStyle(ButtonStyle.Secondary),
             ),
             new ActionRowBuilder().addComponents(
@@ -241,7 +412,7 @@ function buildSetupEmbed(state) {
     };
 }
 
-// Component rows 
+// ─── Component rows ───────────────────────────────────────────────────────────
 const B = (id, label, active) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(active ? ButtonStyle.Primary : ButtonStyle.Secondary);
 function statsRow(uid, gid, active) {
     return new ActionRowBuilder().addComponents(B(`stats_user_${uid}_${gid}`, 'User Stats', active === 'user'), B(`stats_server_${uid}_${gid}`, 'Server Stats', active === 'server'));
@@ -255,24 +426,35 @@ function paginationRow(type, ctx, page, tp) {
         new ButtonBuilder().setCustomId(`${base}_p${page}`).setLabel('↺').setStyle(ButtonStyle.Secondary),
     );
 }
+// Global leaderboard tabs (users + all 4 server modes)
 function globalTabRow(active) {
-    return new ActionRowBuilder().addComponents(B('lbt_gu', 'Users', active === 'gu'), B('lbt_gs', 'Servers', active === 'gs'));
-}
-function serverFilterRow(filter) {
     return new ActionRowBuilder().addComponents(
-        B('gsf_all',         'All',           filter === 'all'),
-        B('gsf_interactive', '🎮 Interactive', filter === 'interactive'),
-        B('gsf_simple',      '🟢 Simple',      filter === 'simple'),
+        B('lbt_gu',          '👥 Users',         active === 'gu'),
+        B('lbt_gs_interactive', '🎮 Interactive', active === 'gs_interactive'),
+        B('lbt_gs_simple',      '🟢 Simple',      active === 'gs_simple'),
+        B('lbt_gs_countdown',   '⏳ Countdown',   active === 'gs_countdown'),
+        B('lbt_gs_random',      '🎲 Random',      active === 'gs_random'),
+    );
+}
+// Highscore tabs — separate tabs per mode (no "All")
+function highscoreTabRow(active) {
+    return new ActionRowBuilder().addComponents(
+        B('hst_interactive', '🎮 Interactive', active === 'interactive'),
+        B('hst_simple',      '🟢 Simple',      active === 'simple'),
+        B('hst_random',      '🎲 Random',      active === 'random'),
+        B('hst_countdown',   '⏳ Countdown',   active === 'countdown'),
     );
 }
 function countTypeRow(current) {
     return new ActionRowBuilder().addComponents(
-        B('ct_interactive', 'Interactive', current === 'interactive'),
-        B('ct_simple', 'Simple', current === 'simple'),
+        B('ct_interactive', '🎮 Interactive', current === 'interactive'),
+        B('ct_simple',      '🟢 Simple',      current === 'simple'),
+        B('ct_countdown',   '⏳ Countdown',   current === 'countdown'),
+        B('ct_random',      '🎲 Random',      current === 'random'),
     );
 }
 
-// Math (complex number evaluator) 
+// ─── Math (complex number evaluator) ─────────────────────────────────────────
 const SUP = { '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9', '⁺': '+', '⁻': '-' };
 
 class C {
@@ -296,7 +478,6 @@ const CCONSTS = {
     pi: new C(Math.PI), e: new C(Math.E), phi: new C((1 + Math.sqrt(5)) / 2),
     tau: new C(Math.PI * 2), sqrt2: new C(Math.SQRT2), i: new C(0, 1),
 };
-// Lambert W function (principal branch W₀) via Halley's method
 function lambertW(x) {
     if (x < -1/Math.E) return NaN;
     let w = x < 1 ? x : Math.log(x);
@@ -307,7 +488,29 @@ function lambertW(x) {
     }
     return w;
 }
-const CFUNCS_REAL = { floor: v => new C(Math.floor(v.r)), ceil: v => new C(Math.ceil(v.r)), abs: v => new C(Math.hypot(v.r, v.i)), lambertw: v => new C(lambertW(v.r)), lw: v => new C(lambertW(v.r)), w: v => new C(lambertW(v.r)) };
+const CFUNCS_REAL = {
+    floor: v => new C(Math.floor(v.r)),
+    ceil:  v => new C(Math.ceil(v.r)),
+    round: v => new C(Math.round(v.r)),
+    abs:   v => new C(Math.hypot(v.r, v.i)),
+    ln:    v => new C(Math.log(v.r)),
+    log:   v => new C(Math.log10(v.r)),
+    log2:  v => new C(Math.log2(v.r)),
+    log10: v => new C(Math.log10(v.r)),
+    exp:   v => new C(Math.exp(v.r)),
+    sin:   v => new C(Math.sin(v.r)),
+    cos:   v => new C(Math.cos(v.r)),
+    tan:   v => new C(Math.tan(v.r)),
+    asin:  v => new C(Math.asin(v.r)),
+    acos:  v => new C(Math.acos(v.r)),
+    atan:  v => new C(Math.atan(v.r)),
+    sinh:  v => new C(Math.sinh(v.r)),
+    cosh:  v => new C(Math.cosh(v.r)),
+    tanh:  v => new C(Math.tanh(v.r)),
+    lambertw: v => new C(lambertW(v.r)),
+    lw: v => new C(lambertW(v.r)),
+    w:  v => new C(lambertW(v.r)),
+};
 const CONSTS = { phi: (1 + Math.sqrt(5)) / 2, pi: Math.PI, e: Math.E, tau: Math.PI * 2, sqrt2: Math.SQRT2 };
 
 function safeMath(expr) {
@@ -318,8 +521,8 @@ function safeMath(expr) {
         } else norm += s[k];
     }
     s = norm.replace(/[×·•]/g, '*').replace(/÷/g, '/').replace(/−/g, '-').replace(/\s+/g, '').toLowerCase();
-    s = s.replace(/(?<=[\d)])x(?=[\d(])/g, '*'); // 5x4 → 5*4
-    s = s.replace(/\*\*/g, '^'); // ** acts as power
+    s = s.replace(/(?<=[\d)])x(?=[\d(])/g, '*');
+    s = s.replace(/\*\*/g, '^');
     s = s.replace(/(\d+)√/g, (_, n) => `nrt${n}(`);
     s = s.replace(/∜/g, 'nrt4(').replace(/∛/g, 'cbrt(').replace(/√/g, 'sqrt(');
 
@@ -336,7 +539,7 @@ function safeMath(expr) {
         } else k++;
     }
 
-    const FUNCS = new Set(['sqrt', 'cbrt', 'floor', 'ceil', 'abs', 'lambertw', 'lw', 'w']);
+    const FUNCS = new Set(['sqrt','cbrt','floor','ceil','round','abs','ln','log','log2','log10','exp','sin','cos','tan','asin','acos','atan','sinh','cosh','tanh','lambertw','lw','w']);
     const isFunc = v => FUNCS.has(v) || /^nrt\d+$/.test(v);
     const out = [];
     for (let j = 0; j < tokens.length; j++) {
@@ -385,7 +588,7 @@ function safeMath(expr) {
                 if (peek() && peek().v === ')') consume();
                 if (tok.v === 'sqrt') return arg.sqrt();
                 if (tok.v === 'cbrt') return arg.cbrt();
-                if (tok.v === 'floor' || tok.v === 'ceil' || tok.v === 'abs') return CFUNCS_REAL[tok.v](arg);
+                if (CFUNCS_REAL[tok.v]) return CFUNCS_REAL[tok.v](arg);
                 if (/^nrt(\d+)$/.test(tok.v)) return arg.nthRoot(parseInt(tok.v.slice(3)));
                 throw new Error(`unknown fn: ${tok.v}`);
             }
@@ -432,46 +635,64 @@ function generateExpressions(n) {
     return res.slice(0, 3);
 }
 
-// Help 
+// ─── Help ─────────────────────────────────────────────────────────────────────
 function buildHelpPage(page) {
     const pages = [
-        E('#5865F2', '🎮 How to Play').setDescription('Count up together in the counting channel! Anyone who breaks the chain resets it to 1.').addFields(
+        E('#5865F2', '🎮 How to Play').setDescription('Count up (or down!) together in the counting channel.').addFields(
             { name: 'Rules', value: '• Type the next number\n• Can\'t count twice in a row (default)\n• Wrong number resets to 1!\n• Math expressions supported' },
             { name: 'Correct', value: 'React added, count goes up' },
             { name: 'Wrong / too fast', value: 'Count resets!' },
             { name: 'Milestones', value: 'Bot celebrates every 100 counts' },
             { name: 'Saves', value: 'The server earns 1 save every 50 counts. Anyone can use it within 1 minute to undo a ruin!' },
             { name: 'Simple mode', value: 'No resets — wrong messages are silently deleted.' },
-        ).setFooter({ text: 'Page 1/4' }),
+        ).setFooter({ text: 'Page 1/5' }),
         E('#5865F2', 'Commands').setDescription('All commands:').addFields(
             { name: 'Counting', value: '`/counting reset`' },
             { name: 'Config',   value: '`/config channel` `/config setcount` `/config view` `/config maxstreak` `/config expressions` `/config access` `/config counttype`' },
             { name: 'Stats',    value: '`/stats [user]` `/leaderboard server` `/leaderboard global` `/leaderboard highscores`' },
             { name: 'Utilities', value: '`/calculate [expression]` `/invite` `/help` `/setup`' },
-        ).setFooter({ text: 'Page 2/4' }),
+        ).setFooter({ text: 'Page 2/5' }),
         E('#5865F2', 'Config').setDescription('Requires Administrator or configured access role.').addFields(
             { name: '/config maxstreak <n>',      value: 'Max consecutive counts per user (1–20)' },
             { name: '/config expressions <bool>', value: 'Allow/block math expressions' },
             { name: '/config access',             value: 'Set which role can use config commands' },
-            { name: '/config counttype',          value: 'Switch between Interactive and Simple mode' },
+            { name: '/config counttype',          value: 'Switch between Interactive, Simple, Countdown, and Random mode' },
             { name: '/setup',                     value: 'All-in-one setup panel for admins' },
-        ).setFooter({ text: 'Page 3/4' }),
+        ).setFooter({ text: 'Page 3/5' }),
+        E('#5865F2', '⏳ Countdown & 🎲 Random Modes').addFields(
+            { name: '⏳ Countdown Mode', value: 'Count DOWN from 100 to 1! When you hit 1, the cycle completes and resets. Each server tracks its completed cycles on the global leaderboard.' },
+            { name: 'Countdown Rules', value: '• Type the next number going DOWN\n• Wrong number resets to 100\n• Saves still work\n• Cycles are tracked globally' },
+            { name: '🎲 Random Mode', value: 'Like Interactive, but a random modifier changes what numbers are valid! The modifier changes every time the count resets.' },
+            { name: 'Random Modifiers', value: '• Every 2nd / 3rd number\n• Primes only\n• Fibonacci sequence\n• Perfect squares\n• Palindromes\n• Multiples of 7\n• Triangular numbers' },
+        ).setFooter({ text: 'Page 4/5' }),
         E('#5865F2', 'Expressions').setDescription('Math expressions, rounded to nearest whole number.').addFields(
             { name: 'Operators', value: '`+` `-` `*` `/` `^`' },
             { name: 'Constants', value: '`pi` `phi` `e` `tau` `sqrt2`' },
-            { name: 'Examples',  value: '`2+2`→**4** `pi^2`→**10** `phi^10`→**11** `2^8`→**256**' },
+            { name: 'Functions', value: '`ln` `log` `log2` `sqrt` `cbrt` `sin` `cos` `tan` `asin` `acos` `atan` `floor` `ceil` `abs` `exp` `round`' },
+            { name: 'Examples',  value: '`ln(e)`→**1** `log(10)`→**1** `sin(pi)`→**0** `pi^2`→**10** `2^8`→**256**' },
             { name: '/calculate', value: 'Type a number to get 3 expressions, or type your own expression to evaluate it!' },
-        ).setFooter({ text: 'Page 4/4' }),
+        ).setFooter({ text: 'Page 5/5' }),
     ];
     const row = new ActionRowBuilder().addComponents(
-        B('help_1', 'How to Play', page === 1), B('help_2', 'Commands', page === 2), B('help_3', 'Config', page === 3), B('help_4', 'Expressions', page === 4),
+        B('help_1', 'How to Play', page === 1), B('help_2', 'Commands', page === 2), B('help_3', 'Config', page === 3), B('help_4', 'New Modes', page === 4), B('help_5', 'Expressions', page === 5),
     );
     return { embeds: [pages[page - 1]], components: [row] };
 }
 
-// Save / reset helpers 
+// ─── Save / reset helpers ─────────────────────────────────────────────────────
 function doReset(guildId, state, userId) {
-    state.current = 0; state.lastUserId = null; state.consecutiveCount = 0;
+    if (state.countType === 'countdown') {
+        state.current = state.countdownStart ?? 100;
+    } else if (state.countType === 'random') {
+        // Pick a new modifier on reset
+        const mod = pickRandomModifier();
+        state.randomModifier = mod.id;
+        state.randomModifierLabel = mod.label;
+        state.current = 0;
+    } else {
+        state.current = 0;
+    }
+    state.lastUserId = null; state.consecutiveCount = 0;
     delete state.pendingSave;
     saveState(guildId, state);
     updateUserStat(guildId, userId, { ruined: 1 });
@@ -499,39 +720,40 @@ async function triggerRuin(channel, guildId, state, userId, reason) {
             const fresh = await getState(guildId);
             if (!fresh.pendingSave || fresh.pendingSave.expiresAt !== expiresAt) return;
             doReset(guildId, fresh, userId);
-            await prompt.edit({ embeds: [E('#ff4444', '💥 Save expired!').setDescription(`<@${userId}> didn't use their save in time. Resets from **${prev}** to **1**.`)], components: [] }).catch(() => {});
+            await prompt.edit({ embeds: [E('#ff4444', '💥 Save expired!').setDescription(`<@${userId}> didn't use their save in time. Count resets!`)], components: [] }).catch(() => {});
         }, 60_000);
     } else {
         doReset(guildId, state, userId);
-        await channel.send({ embeds: [E('#ff4444', '💥 Count ruined!').setDescription(`<@${userId}> ruined the count! (${reason})\nCount was at **${prev}**.`).addFields({ name: 'Reset to', value: '**1**', inline: true }, { name: 'High Score', value: `**${state.highScore}**`, inline: true }).setFooter({ text: 'Start again from 1!' })] }).catch(e => console.error('ruin msg failed:', e.message));
+        const resetTo = state.countType === 'countdown' ? (state.countdownStart ?? 100) : 1;
+        await channel.send({ embeds: [E('#ff4444', '💥 Count ruined!').setDescription(`<@${userId}> ruined the count! (${reason})\nCount was at **${prev}**.`).addFields({ name: 'Reset to', value: `**${resetTo}**`, inline: true }, { name: 'High Score', value: `**${state.highScore}**`, inline: true }).setFooter({ text: `Start again from ${resetTo}!` })] }).catch(e => console.error('ruin msg failed:', e.message));
     }
 }
 
-// Keep-alive 
+// ─── Keep-alive ───────────────────────────────────────────────────────────────
 function keepAlive() {
     const ping = () => { const u = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`; (u.startsWith('https') ? require('https') : http).get(u, () => {}).on('error', () => {}); };
     setTimeout(ping, 5000); setInterval(ping, 14 * 60 * 1000);
 }
 
-//  
+// ─── Ready ────────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
     console.log(`Online as ${client.user.tag}`);
-    client.user.setPresence({ activities: [{ name: 'Now with pride support!', type: ActivityType.Watching }], status: 'online' });
+    client.user.setPresence({ activities: [{ name: 'Counting things', type: ActivityType.Watching }], status: 'online' });
     const cmds = [
         new SlashCommandBuilder().setName('counting').setDescription('Configure or view the counting game')
             .addSubcommand(s => s.setName('reset').setDescription('Manually reset the count')),
         new SlashCommandBuilder().setName('config').setDescription('Configure bot settings')
             .addSubcommand(s => s.setName('channel').setDescription('Set the counting channel').addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true)))
-            .addSubcommand(s => s.setName('setcount').setDescription('Set the current count (transfer from another bot)').addIntegerOption(o => o.setName('number').setDescription('Number').setRequired(true).setMinValue(0).setMaxValue(1000)))
+            .addSubcommand(s => s.setName('setcount').setDescription('Set the current count').addIntegerOption(o => o.setName('number').setDescription('Number').setRequired(true).setMinValue(0).setMaxValue(1000)))
             .addSubcommand(s => s.setName('view').setDescription('View current count and settings'))
             .addSubcommand(s => s.setName('maxstreak').setDescription('Max consecutive counts per user').addIntegerOption(o => o.setName('amount').setDescription('1–100').setRequired(true).setMinValue(1).setMaxValue(100)))
             .addSubcommand(s => s.setName('expressions').setDescription('Allow math expressions').addBooleanOption(o => o.setName('enabled').setDescription('Enable/disable').setRequired(true)))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can use config'))
-            .addSubcommand(s => s.setName('counttype').setDescription('Switch between Interactive and Simple counting mode')),
+            .addSubcommand(s => s.setName('counttype').setDescription('Switch counting mode (Interactive, Simple, Countdown, Random)')),
         new SlashCommandBuilder().setName('leaderboard').setDescription('View leaderboards')
             .addSubcommand(s => s.setName('server').setDescription('Top counters in this server'))
             .addSubcommand(s => s.setName('global').setDescription('Global leaderboard'))
-            .addSubcommand(s => s.setName('highscores').setDescription('Servers by all-time high score')),
+            .addSubcommand(s => s.setName('highscores').setDescription('Servers by mode high score / cycles')),
         new SlashCommandBuilder().setName('stats').setDescription('View counting stats').addUserOption(o => o.setName('user').setDescription('User to check')),
         new SlashCommandBuilder().setName('calculate').setDescription('Calculate an expression, or get 3 expressions for a number')
             .addStringOption(o => o.setName('input').setDescription('A number (e.g. 42) or expression (e.g. pi^2+1)').setRequired(true)),
@@ -550,7 +772,7 @@ client.once('ready', async () => {
     keepAlive();
 });
 
-// Message counting 
+// ─── Message counting ─────────────────────────────────────────────────────────
 client.on('messageCreate', async message => {
     if (message.author.bot || !message.guild) return;
     const gid = message.guild.id;
@@ -566,32 +788,154 @@ client.on('messageCreate', async message => {
     const hasConst = Object.keys(CONSTS).some(c => new RegExp(`(?<![a-z])${c}(?![a-z])`, 'i').test(raw));
     const isExpr = (/[+\-*/^()]/.test(raw) && !/^\-?\d+$/.test(raw)) || hasConst;
     const value = safeMath(raw);
-    const expected = state.current + 1;
 
+    // ── SIMPLE MODE ──
     if (state.countType === 'simple') {
+        const expected = state.current + 1;
         const sameUser = message.author.id === state.lastUserId;
         const newStreak = sameUser ? state.consecutiveCount + 1 : 1;
         const streakViolation = state.maxStreak > 0 && sameUser && newStreak > state.maxStreak;
-        const isAttempt = value !== null || isExpr; // plain text messages are not attempts
-        if (!isAttempt) return; // leave non-number messages alone
+        const isAttempt = value !== null || isExpr;
+        if (!isAttempt) return;
         if (value === null || value !== expected || streakViolation) {
             const me = message.guild.members.me;
-            if (!me?.permissionsIn(message.channel).has(PermissionFlagsBits.ManageMessages)) {
-                console.error('Simple mode: missing ManageMessages permission in channel', message.channel.id);
-                return;
-            }
-            await message.delete().catch(e => console.error('Simple mode delete failed:', e.message));
+            if (!me?.permissionsIn(message.channel).has(PermissionFlagsBits.ManageMessages)) return;
+            await message.delete().catch(() => {});
             return;
         }
         state.current = value; state.lastUserId = message.author.id; state.consecutiveCount = newStreak;
         if (value > state.highScore) state.highScore = value;
         saveState(gid, state);
-        updateUserStat(gid, message.author.id, { correct: 1 }); // fire-and-forget
+        updateUserStat(gid, message.author.id, { correct: 1 });
         const ne = ['0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣'];
         await message.react(value <= 9 ? ne[value] : '✅').catch(() => {});
         if (value % 100 === 0) await message.channel.send({ embeds: [E('#00cc88', `🎉 ${value} reached!`).setDescription(`The count hit **${value}** thanks to <@${message.author.id}>!`)] }).catch(() => {});
         return;
     }
+
+    // ── COUNTDOWN MODE ──
+    if (state.countType === 'countdown') {
+        if (isExpr && !state.allowExpressions) {
+            await message.react('❌').catch(() => {});
+            const s = await message.channel.send({ embeds: [E('#ff4444', 'Expressions disabled').setDescription(`Expressions not allowed here!`)] }).catch(() => null);
+            if (s) setTimeout(() => s.delete().catch(() => {}), 5000);
+            return;
+        }
+        if (value === null) return;
+
+        const start = state.countdownStart ?? 100;
+        // Initialize if never set
+        if (state.current === 0 || state.current > start) state.current = start;
+        const expected = state.current - 1;
+
+        if (value !== expected) {
+            if (!await claimMessage(message.id)) return;
+            message.react('❌').catch(() => {});
+            await triggerRuin(message.channel, gid, state, message.author.id, `sent \`${value}\` but expected \`${expected}\``);
+            return;
+        }
+        if (state.maxStreak > 0 && message.author.id === state.lastUserId && state.consecutiveCount >= state.maxStreak) {
+            if (!await claimMessage(message.id)) return;
+            message.react('❌').catch(() => {});
+            await triggerRuin(message.channel, gid, state, message.author.id, `counted more than **${state.maxStreak}** time(s) in a row`);
+            return;
+        }
+
+        const same = message.author.id === state.lastUserId;
+        state.current = value;
+        state.lastUserId = message.author.id;
+        state.consecutiveCount = same ? state.consecutiveCount + 1 : 1;
+        saveState(gid, state);
+        updateUserStat(gid, message.author.id, { correct: 1 });
+
+        const ne = ['0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣'];
+        await message.react(value <= 9 && value >= 0 ? ne[value] : '✅').catch(() => {});
+
+        // Cycle complete!
+        if (value === 1) {
+            state.countdownCycles = (state.countdownCycles ?? 0) + 1;
+            state.current = start;
+            state.lastUserId = null;
+            state.consecutiveCount = 0;
+            saveState(gid, state);
+            await message.channel.send({
+                embeds: [E('#ffd700', `🎉 Countdown Complete! Cycle #${state.countdownCycles}`)
+                    .setDescription(`The count reached **1**! 🎊 Incredible work, <@${message.author.id}> finished it off!\nThe countdown has been reset to **${start}**. Let's go again!`)
+                    .addFields(
+                        { name: '🔄 Cycles completed', value: `**${state.countdownCycles}**`, inline: true },
+                        { name: '🔢 Restarting from', value: `**${start}**`, inline: true },
+                    )
+                    .setFooter({ text: 'Can you do it again?' })],
+            }).catch(() => {});
+        } else if (value % 25 === 0) {
+            await message.channel.send({ embeds: [E('#00cc88', `⏳ ${value} to go!`).setDescription(`Getting closer! **${value}** left to count down.`)] }).catch(() => {});
+        }
+        return;
+    }
+
+    // ── RANDOM MODE ──
+    if (state.countType === 'random') {
+        // Initialize modifier if none set
+        if (!state.randomModifier) {
+            const mod = pickRandomModifier();
+            state.randomModifier = mod.id;
+            state.randomModifierLabel = mod.label;
+            saveState(gid, state);
+            await message.channel.send({ embeds: [E('#9b59b6', '🎲 New Random Modifier!').setDescription(`The modifier for this round is:\n**${mod.label}**\n${mod.desc}`)] }).catch(() => {});
+        }
+
+        if (isExpr && !state.allowExpressions) {
+            await message.react('❌').catch(() => {});
+            const s = await message.channel.send({ embeds: [E('#ff4444', 'Expressions disabled').setDescription(`Expressions not allowed!`)] }).catch(() => null);
+            if (s) setTimeout(() => s.delete().catch(() => {}), 5000);
+            return;
+        }
+        if (value === null) return;
+
+        const mod = getModifier(state.randomModifier);
+        // expected is the next valid number after state.current
+        const expected = state.current === 0 ? firstValidForModifier(state.randomModifier) : mod.next(state.current);
+
+        if (value !== expected) {
+            if (!await claimMessage(message.id)) return;
+            message.react('❌').catch(() => {});
+            await triggerRuin(message.channel, gid, state, message.author.id, `sent \`${value}\` but expected \`${expected}\` (modifier: ${mod.label})`);
+            return;
+        }
+        if (state.maxStreak > 0 && message.author.id === state.lastUserId && state.consecutiveCount >= state.maxStreak) {
+            if (!await claimMessage(message.id)) return;
+            message.react('❌').catch(() => {});
+            await triggerRuin(message.channel, gid, state, message.author.id, `counted more than **${state.maxStreak}** time(s) in a row`);
+            return;
+        }
+
+        const same = message.author.id === state.lastUserId;
+        state.current = value;
+        state.lastUserId = message.author.id;
+        state.consecutiveCount = same ? state.consecutiveCount + 1 : 1;
+        if (value > state.highScore) state.highScore = value;
+        saveState(gid, state);
+        updateUserStat(gid, message.author.id, { correct: 1 });
+
+        const earnedSave = value % 50 === 0;
+        if (earnedSave) {
+            state.saves = (state.saves ?? 0) + 1;
+            saveState(gid, state);
+            await message.channel.send({ embeds: [E('#ffd700', '🛡️ Save earned!').setDescription(`The server earned a **Save** for reaching **${value}**! (**${state.saves}** total)`)] }).catch(() => {});
+        }
+
+        await message.react('✅').catch(() => {});
+        // Show hint for next number
+        const nextHint = mod.hint(value);
+        if (value % 10 === 0 || value <= 5) {
+            await message.channel.send({ embeds: [E('#9b59b6', `🎲 ${value}!`).setDescription(`${nextHint} — Modifier: **${mod.label}**`)] }).catch(() => {});
+        }
+        if (value % 100 === 0) await message.channel.send({ embeds: [E('#00cc88', `🎉 ${value} reached!`).setDescription(`The count hit **${value}** thanks to <@${message.author.id}>! 🎲 Modifier: ${mod.label}`).setFooter({ text: `High score: ${state.highScore}` })] }).catch(() => {});
+        return;
+    }
+
+    // ── INTERACTIVE MODE (default) ──
+    const expected = state.current + 1;
 
     if (isExpr && !state.allowExpressions) {
         await message.react('❌').catch(() => {});
@@ -599,7 +943,7 @@ client.on('messageCreate', async message => {
         if (s) setTimeout(() => s.delete().catch(() => {}), 5000);
         return;
     }
-    if (value === null) return; // not a number at all — ignore silently
+    if (value === null) return;
     if (value !== expected) {
         if (!await claimMessage(message.id)) return;
         message.react('❌').catch(() => {});
@@ -619,7 +963,7 @@ client.on('messageCreate', async message => {
     saveState(gid, state);
 
     const earnedSave = value % 50 === 0;
-    updateUserStat(gid, message.author.id, { correct: 1 }); // fire-and-forget
+    updateUserStat(gid, message.author.id, { correct: 1 });
     if (earnedSave) {
         state.saves = (state.saves ?? 0) + 1;
         saveState(gid, state);
@@ -630,26 +974,36 @@ client.on('messageCreate', async message => {
     if (value % 100 === 0) await message.channel.send({ embeds: [E('#00cc88', `🎉 ${value} reached!`).setDescription(`The count hit **${value}** thanks to <@${message.author.id}>!`).setFooter({ text: `High score: ${state.highScore}` })] }).catch(() => {});
 });
 
-// Interactions 
+// ─── Interactions ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
     const gid = interaction.guild?.id;
 
     if (interaction.isButton()) {
         const id = interaction.customId;
 
+        // ── Help pages ──
         if (id.startsWith('help_')) {
             const p = parseInt(id.split('_')[1]);
-            if (!isNaN(p) && p >= 1 && p <= 4) return interaction.update(buildHelpPage(p));
+            if (!isNaN(p) && p >= 1 && p <= 5) return interaction.update(buildHelpPage(p));
         }
 
+        // ── Setup panel ──
         if (id.startsWith('setup_')) {
             if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator))
                 return interaction.reply({ content: 'Admins only.', ...ep() });
             const state = await getState(gid);
-
             if (id === 'setup_refresh') return interaction.update(buildSetupEmbed(state));
             if (id === 'setup_counttype') {
-                state.countType = state.countType === 'interactive' ? 'simple' : 'interactive';
+                // cycle through modes
+                const cycle = { interactive: 'simple', simple: 'countdown', countdown: 'random', random: 'interactive' };
+                state.countType = cycle[state.countType ?? 'interactive'] ?? 'interactive';
+                // Initialize countdown/random state if needed
+                if (state.countType === 'countdown' && !state.current) state.current = state.countdownStart ?? 100;
+                if (state.countType === 'random' && !state.randomModifier) {
+                    const mod = pickRandomModifier();
+                    state.randomModifier = mod.id;
+                    state.randomModifierLabel = mod.label;
+                }
                 saveState(gid, state); return interaction.update(buildSetupEmbed(state));
             }
             if (id === 'setup_expressions') {
@@ -657,52 +1011,62 @@ client.on('interactionCreate', async interaction => {
                 saveState(gid, state); return interaction.update(buildSetupEmbed(state));
             }
             if (id === 'setup_reset') {
-                const prev = state.current; state.current = 0; state.lastUserId = null; state.consecutiveCount = 0;
+                const prev = state.current;
+                if (state.countType === 'countdown') {
+                    state.current = state.countdownStart ?? 100;
+                } else {
+                    state.current = 0;
+                }
+                state.lastUserId = null; state.consecutiveCount = 0;
                 saveState(gid, state);
-                if (state.channelId) { const ch = interaction.guild.channels.cache.get(state.channelId); if (ch) ch.send({ embeds: [E('#ff9900', '🔄 Count reset').setDescription(`Admin reset from **${prev}** to 0. Start again from **1**!`)] }).catch(() => {}); }
+                if (state.channelId) { const ch = interaction.guild.channels.cache.get(state.channelId); if (ch) ch.send({ embeds: [E('#ff9900', '🔄 Count reset').setDescription(`Admin reset from **${prev}**. Start again!`)] }).catch(() => {}); }
                 return interaction.update(buildSetupEmbed(state));
             }
             if (id === 'setup_setchannel') {
-                return interaction.reply({
-                    embeds: [E('#5865F2', 'Set Counting Channel').setDescription('Select the channel to use for counting:')],
-                    components: [new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('setup_channel_select').setPlaceholder('Select a text channel').addChannelTypes(ChannelType.GuildText).setMinValues(1).setMaxValues(1))],
-                    ...ep(),
-                });
+                return interaction.reply({ embeds: [E('#5865F2', 'Set Counting Channel').setDescription('Select the channel to use for counting:')], components: [new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId('setup_channel_select').setPlaceholder('Select a text channel').addChannelTypes(ChannelType.GuildText).setMinValues(1).setMaxValues(1))], ...ep() });
             }
             if (id === 'setup_access') {
-                return interaction.reply({
-                    embeds: [E('#5865F2', 'Set Access Role').setDescription('Select which role can use `/config` commands:')],
-                    components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('setup_role_select').setPlaceholder('Select a role').setMinValues(1).setMaxValues(1))],
-                    ...ep(),
-                });
+                return interaction.reply({ embeds: [E('#5865F2', 'Set Access Role').setDescription('Select which role can use `/config` commands:')], components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId('setup_role_select').setPlaceholder('Select a role').setMinValues(1).setMaxValues(1))], ...ep() });
             }
         }
 
-        if (id === 'ct_interactive' || id === 'ct_simple') {
+        // ── Count type buttons ──
+        if (['ct_interactive','ct_simple','ct_countdown','ct_random'].includes(id)) {
             if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator) && !await hasPerm(interaction, gid))
                 return interaction.reply({ content: 'No permission.', ...ep() });
             const state = await getState(gid);
-            state.countType = id === 'ct_interactive' ? 'interactive' : 'simple';
+            const newType = id.slice(3); // 'interactive' | 'simple' | 'countdown' | 'random'
+            state.countType = newType;
+            if (newType === 'countdown' && (!state.current || state.current > (state.countdownStart ?? 100))) {
+                state.current = state.countdownStart ?? 100;
+                state.lastUserId = null; state.consecutiveCount = 0;
+            }
+            if (newType === 'random' && !state.randomModifier) {
+                const mod = pickRandomModifier();
+                state.randomModifier = mod.id;
+                state.randomModifierLabel = mod.label;
+            }
             saveState(gid, state);
+            const descriptions = {
+                interactive: 'Back to **Interactive** mode. Wrong numbers and streaks will reset the count!',
+                simple:      '**Simple** mode enabled. Wrong messages are silently deleted.',
+                countdown:   `**Countdown** mode enabled! Count DOWN from **${state.countdownStart ?? 100}** to **1**. Complete a cycle to earn glory!`,
+                random:      `**Random** mode enabled! Current modifier: **${state.randomModifierLabel ?? 'none'}**\nThe modifier changes every reset — good luck!`,
+            };
             return interaction.update({
-                embeds: [E('#5865F2', `Count type set to ${state.countType === 'interactive' ? 'Interactive' : 'Simple'}`)
-                    .setDescription(state.countType === 'interactive'
-                        ? 'Back to **Interactive** mode. Wrong numbers and streaks will reset the count!'
-                        : '**Simple** mode enabled. Wrong messages are silently deleted. The count never resets!')],
-                components: [countTypeRow(state.countType)],
+                embeds: [E('#5865F2', `Mode set to ${MODE_EMOJI[newType]} ${MODE_LABEL[newType]}`).setDescription(descriptions[newType])],
+                components: [countTypeRow(newType)],
             });
         }
 
+        // ── Save buttons ──
         if (id.startsWith('saveuse_') || id.startsWith('savedecline_')) {
             const parts = id.split('_');
             const action = parts[0], ownerId = parts[1], prevCount = parseInt(parts[2]), btnGid = parts[3], expiresAt = parseInt(parts[4]);
-
             if (interaction.user.id !== ownerId) return interaction.reply({ content: 'Only the person who ruined the count can do this!', ...ep() });
             if (Date.now() > expiresAt) return interaction.reply({ content: 'Save prompt has expired.', ...ep() });
-
             const state = await getState(btnGid);
             delete state.pendingSave;
-
             if (action === 'saveuse') {
                 if ((state.saves ?? 0) < 1) return interaction.reply({ content: 'The server has no saves left.', ...ep() });
                 state.current = prevCount; state.lastUserId = ownerId; state.consecutiveCount = 1;
@@ -710,94 +1074,120 @@ client.on('interactionCreate', async interaction => {
                 state.savesUsed = (state.savesUsed ?? 0) + 1;
                 saveState(btnGid, state);
                 await updateUserStat(btnGid, ownerId, { savesUsed: 1 });
+                const nextNum = state.countType === 'countdown' ? prevCount - 1 : prevCount + 1;
                 return interaction.update({
-                    embeds: [E('#00cc88', '🛡️ Save used!').setDescription(`<@${ownerId}> used a **Save** — count stays at **${prevCount}**!`).addFields({ name: 'Remaining', value: `**${state.saves}**`, inline: true }, { name: "Next number", value: `**${prevCount + 1}**`, inline: true })],
+                    embeds: [E('#00cc88', '🛡️ Save used!').setDescription(`<@${ownerId}> used a **Save** — count stays at **${prevCount}**!`).addFields({ name: 'Remaining', value: `**${state.saves}**`, inline: true }, { name: 'Next number', value: `**${nextNum}**`, inline: true })],
                     components: [],
                 });
             } else {
-                state.current = 0; state.lastUserId = null; state.consecutiveCount = 0;
+                const resetTo = state.countType === 'countdown' ? (state.countdownStart ?? 100) : 1;
+                if (state.countType === 'countdown') { state.current = resetTo; }
+                else if (state.countType === 'random') {
+                    const mod = pickRandomModifier();
+                    state.randomModifier = mod.id; state.randomModifierLabel = mod.label;
+                    state.current = 0;
+                } else { state.current = 0; }
+                state.lastUserId = null; state.consecutiveCount = 0;
                 saveState(btnGid, state);
                 updateUserStat(btnGid, ownerId, { ruined: 1 });
+                const newModNote = state.countType === 'random' ? `\nNew modifier: **${state.randomModifierLabel}**` : '';
                 return interaction.update({
-                    embeds: [E('#ff4444', '💥 Count ruined!').setDescription(`<@${ownerId}> declined the save. Resets from **${prevCount}** to **1**.`).addFields({ name: 'High Score', value: `**${state.highScore}**`, inline: true })],
+                    embeds: [E('#ff4444', '💥 Count ruined!').setDescription(`<@${ownerId}> declined the save. Count resets to **${resetTo}**.${newModNote}`).addFields({ name: 'High Score', value: `**${state.highScore}**`, inline: true })],
                     components: [],
                 });
             }
         }
 
+        // ── Stats buttons ──
         if (id.startsWith('stats_')) {
             await interaction.deferUpdate();
             const [, view, tuid, bgid] = id.split('_');
             try {
                 if (view === 'user') { const u = await client.users.fetch(tuid).catch(() => interaction.user); return interaction.editReply({ embeds: [await buildUserStatsEmbed(bgid, u)], components: [statsRow(tuid, bgid, 'user')] }); }
                 if (view === 'server') { const g = client.guilds.cache.get(bgid) ?? await client.guilds.fetch(bgid).catch(() => interaction.guild); return interaction.editReply({ embeds: [await buildServerStatsEmbed(g)], components: [statsRow(tuid, bgid, 'server')] }); }
-            } catch (e) { console.error('stats btn:', e); return interaction.editReply({ content: 'Failed to load stats.' }); }
+            } catch (e) { return interaction.editReply({ content: 'Failed to load stats.' }); }
         }
 
-        if (id.startsWith('gsf_')) {
+        // ── Global leaderboard tabs ──
+        if (id.startsWith('lbt_')) {
             await interaction.deferUpdate();
             try {
-                const filter = id.slice(4); // 'all', 'interactive', 'simple'
-                const r = await buildGlobalServersEmbed(1, filter);
-                const base = `lb_gs_f${filter}`;
-                const pRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`${base}_p0`).setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(true),
-                    new ButtonBuilder().setCustomId(`${base}_info`).setLabel(`1/${r.totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-                    new ButtonBuilder().setCustomId(`${base}_p2`).setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(r.totalPages <= 1),
-                    new ButtonBuilder().setCustomId(`${base}_p1`).setLabel('↺').setStyle(ButtonStyle.Secondary),
-                );
-                return interaction.editReply({ embeds: [r.embed], components: [globalTabRow('gs'), serverFilterRow(filter), pRow] });
-            } catch (e) { console.error('gsf btn:', e); await interaction.editReply({ content: '❌ Failed.' }).catch(() => {}); }
-        }
-
-        if (id === 'lbt_gu' || id === 'lbt_gs') {
-            await interaction.deferUpdate();
-            try {
-                if (id === 'lbt_gu') { const { embed, totalPages } = await buildGlobalUsersEmbed(1);   return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, totalPages)] }); }
-                if (id === 'lbt_gs') {
-                    const r = await buildGlobalServersEmbed(1, 'all');
-                    const base = 'lb_gs_fall';
+                if (id === 'lbt_gu') {
+                    const { embed, totalPages } = await buildGlobalUsersEmbed(1);
+                    return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, totalPages)] });
+                }
+                const serverFilter = id.replace('lbt_gs_', ''); // 'interactive'|'simple'|'countdown'|'random'
+                if (['interactive','simple','countdown','random'].includes(serverFilter)) {
+                    const r = await buildGlobalServersEmbed(1, serverFilter);
+                    const base = `lb_gs_f${serverFilter}`;
                     const pRow = new ActionRowBuilder().addComponents(
                         new ButtonBuilder().setCustomId(`${base}_p0`).setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(true),
                         new ButtonBuilder().setCustomId(`${base}_info`).setLabel(`1/${r.totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
                         new ButtonBuilder().setCustomId(`${base}_p2`).setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(r.totalPages <= 1),
                         new ButtonBuilder().setCustomId(`${base}_p1`).setLabel('↺').setStyle(ButtonStyle.Secondary),
                     );
-                    return interaction.editReply({ embeds: [r.embed], components: [globalTabRow('gs'), serverFilterRow('all'), pRow] });
+                    return interaction.editReply({ embeds: [r.embed], components: [globalTabRow(`gs_${serverFilter}`), pRow] });
                 }
             } catch (e) { console.error('tab btn:', e); await interaction.editReply({ content: 'Failed to load.' }).catch(() => {}); }
         }
 
+        // ── Highscore mode tabs ──
+        if (id.startsWith('hst_')) {
+            await interaction.deferUpdate();
+            const filter = id.slice(4); // 'interactive'|'simple'|'random'|'countdown'
+            try {
+                const { embed, totalPages } = await buildHighscoresEmbed(1, filter);
+                return interaction.editReply({ embeds: [embed], components: [highscoreTabRow(filter), paginationRow(`hs_${filter}`, '', 1, totalPages)] });
+            } catch (e) { console.error('hst btn:', e); await interaction.editReply({ content: '❌ Failed.' }).catch(() => {}); }
+        }
+
+        // ── Pagination ──
         if (id.startsWith('lb_')) {
             const last = id.split('_').pop();
             if (last === 'info') return interaction.deferUpdate();
             const page = parseInt(last.replace('p', ''));
             if (isNaN(page) || page < 1) return interaction.deferUpdate();
-            const type = id.split('_')[1];
             await interaction.deferUpdate();
             try {
-                if (type === 'gu') { const { embed, totalPages } = await buildGlobalUsersEmbed(page);   return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', page, totalPages)] }); }
+                const type = id.split('_')[1];
+                if (type === 'gu') {
+                    const { embed, totalPages } = await buildGlobalUsersEmbed(page);
+                    return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', page, totalPages)] });
+                }
                 if (type === 'gs') {
-                    // customId: lb_gs_f{filter}_p{page}
                     const filterSeg = id.split('_').find(s => s.startsWith('f'));
-                    const filter = filterSeg ? filterSeg.slice(1) : 'all';
+                    const filter = filterSeg ? filterSeg.slice(1) : 'interactive';
                     const r = await buildGlobalServersEmbed(page, filter);
-                    const pRow = (() => { const base = `lb_gs_f${filter}`; return new ActionRowBuilder().addComponents(
+                    const base = `lb_gs_f${filter}`;
+                    const pRow = new ActionRowBuilder().addComponents(
                         new ButtonBuilder().setCustomId(`${base}_p${page-1}`).setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(page<=1),
                         new ButtonBuilder().setCustomId(`${base}_info`).setLabel(`${page}/${r.totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
                         new ButtonBuilder().setCustomId(`${base}_p${page+1}`).setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(page>=r.totalPages),
                         new ButtonBuilder().setCustomId(`${base}_p${page}`).setLabel('↺').setStyle(ButtonStyle.Secondary),
-                    ); })();
-                    return interaction.editReply({ embeds: [r.embed], components: [globalTabRow('gs'), serverFilterRow(filter), pRow] });
+                    );
+                    return interaction.editReply({ embeds: [r.embed], components: [globalTabRow(`gs_${filter}`), pRow] });
                 }
-                if (type === 'hs') { const { embed, totalPages } = await buildHighscoresEmbed(page);    return interaction.editReply({ embeds: [embed], components: [paginationRow('hs', '', page, totalPages)] }); }
-                if (type === 'sv') { const svgid = id.split('_')[2]; const { embed, totalPages } = await buildServerLbEmbed(svgid, page); return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', svgid, page, totalPages)] }); }
+                // Highscore pagination: lb_hs_<filter>_p<page>
+                if (type === 'hs') {
+                    // extract filter from id e.g. lb_hs_interactive_p2
+                    const parts = id.split('_');
+                    const filterIdx = parts.findIndex(p => ['interactive','simple','random','countdown'].includes(p));
+                    const filter = filterIdx !== -1 ? parts[filterIdx] : 'interactive';
+                    const { embed, totalPages } = await buildHighscoresEmbed(page, filter);
+                    return interaction.editReply({ embeds: [embed], components: [highscoreTabRow(filter), paginationRow(`hs_${filter}`, '', page, totalPages)] });
+                }
+                if (type === 'sv') {
+                    const svgid = id.split('_')[2];
+                    const { embed, totalPages } = await buildServerLbEmbed(svgid, page);
+                    return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', svgid, page, totalPages)] });
+                }
             } catch (e) { console.error('lb btn:', e); await interaction.editReply({ content: 'Failed to load. Try again.' }).catch(() => {}); }
         }
 
         return;
     }
 
+    // ── Select menus ──
     if (interaction.isRoleSelectMenu()) {
         if (interaction.customId === 'setup_role_select') {
             const state = await getState(gid); state.accessRoleId = interaction.values[0]; saveState(gid, state);
@@ -832,14 +1222,13 @@ client.on('interactionCreate', async interaction => {
             const input = options.getString('input').trim();
             const evaluated = safeMath(input);
             const looksLikeNumber = /^[\d]+$/.test(input.replace(/\s/g, ''));
-
             if (looksLikeNumber && evaluated !== null) {
                 const exprs = generateExpressions(evaluated);
-                return interaction.editReply({ embeds: [E('#5865F2', `Ways to write ${evaluated}`).setDescription(`3 expressions for **${evaluated}**:`).addFields(...exprs.map((x, i) => ({ name: `${['1️⃣', '2️⃣', '3️⃣'][i]} \`${x}\``, value: `= **${safeMath(x) ?? evaluated}**`, inline: true }))).setFooter({ text: 'Supports: + - * / ^ pi phi e tau sqrt2' })] });
+                return interaction.editReply({ embeds: [E('#5865F2', `Ways to write ${evaluated}`).setDescription(`3 expressions for **${evaluated}**:`).addFields(...exprs.map((x, i) => ({ name: `${['1️⃣', '2️⃣', '3️⃣'][i]} \`${x}\``, value: `= **${safeMath(x) ?? evaluated}**`, inline: true }))).setFooter({ text: 'Supports: + - * / ^ pi phi e tau sqrt2 · ln log sin cos tan sqrt cbrt' })] });
             } else if (evaluated !== null) {
-                return interaction.editReply({ embeds: [E('#5865F2', 'Result').addFields({ name: 'Expression', value: `\`${input}\``, inline: true }, { name: 'Result', value: `**${evaluated}**`, inline: true }, { name: 'Rounded', value: `\`${evaluated}\``, inline: true }).setFooter({ text: 'Result is rounded to the nearest whole number' })] });
+                return interaction.editReply({ embeds: [E('#5865F2', 'Result').addFields({ name: 'Expression', value: `\`${input}\``, inline: true }, { name: 'Result', value: `**${evaluated}**`, inline: true }).setFooter({ text: 'Rounded to nearest whole number' })] });
             } else {
-                return interaction.editReply({ embeds: [E('#ff4444', 'Invalid expression').setDescription(`\`${input}\` couldn't be evaluated. Make sure you're using valid operators and constants.\n\nConstants: \`pi\` \`phi\` \`e\` \`tau\` \`sqrt2\``)] });
+                return interaction.editReply({ embeds: [E('#ff4444', 'Invalid expression').setDescription(`\`${input}\` couldn't be evaluated.\n\nConstants: \`pi\` \`phi\` \`e\` \`tau\` \`sqrt2\``)] });
             }
         }
 
@@ -852,9 +1241,19 @@ client.on('interactionCreate', async interaction => {
         if (cmd === 'leaderboard') {
             await interaction.deferReply(ep());
             const sub = options.getSubcommand();
-            if (sub === 'server')     { const { embed, totalPages } = await buildServerLbEmbed(gid, 1);  return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', gid, 1, totalPages)] }); }
-            if (sub === 'global')     { const r = await buildGlobalUsersEmbed(1); return interaction.editReply({ embeds: [r.embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, r.totalPages)] }); }
-            if (sub === 'highscores') { const { embed, totalPages } = await buildHighscoresEmbed(1);     return interaction.editReply({ embeds: [embed], components: [paginationRow('hs', '', 1, totalPages)] }); }
+            if (sub === 'server') {
+                const { embed, totalPages } = await buildServerLbEmbed(gid, 1);
+                return interaction.editReply({ embeds: [embed], components: [paginationRow('sv', gid, 1, totalPages)] });
+            }
+            if (sub === 'global') {
+                const { embed, totalPages } = await buildGlobalUsersEmbed(1);
+                return interaction.editReply({ embeds: [embed], components: [globalTabRow('gu'), paginationRow('gu', '', 1, totalPages)] });
+            }
+            if (sub === 'highscores') {
+                // Default to interactive tab
+                const { embed, totalPages } = await buildHighscoresEmbed(1, 'interactive');
+                return interaction.editReply({ embeds: [embed], components: [highscoreTabRow('interactive'), paginationRow('hs_interactive', '', 1, totalPages)] });
+            }
         }
 
         if (cmd === 'config') {
@@ -862,39 +1261,60 @@ client.on('interactionCreate', async interaction => {
             if (sub === 'view') {
                 await interaction.deferReply(ep());
                 const st = await getState(gid);
+                const modeEmoji = MODE_EMOJI[st.countType ?? 'interactive'];
+                const extraFields = [];
+                if (st.countType === 'countdown') extraFields.push({ name: '⏳ Cycles', value: `**${st.countdownCycles ?? 0}**`, inline: true });
+                if (st.countType === 'random' && st.randomModifierLabel) extraFields.push({ name: '🎲 Modifier', value: st.randomModifierLabel, inline: true });
                 return interaction.editReply({ embeds: [E('#5865F2', 'Counting Status').addFields(
-                    { name: 'Channel',    value: st.channelId ? `<#${st.channelId}>` : 'Not set',                                    inline: true },
-                    { name: 'Current',    value: `**${st.current}**`,                                                                 inline: true },
-                    { name: 'High',       value: `**${st.highScore}**`,                                                               inline: true },
-                    { name: 'Streak',     value: `**${st.maxStreak}** in a row`,                                                      inline: true },
-                    { name: 'Expr',       value: st.allowExpressions ? 'Allowed' : 'Disabled',                                        inline: true },
-                    { name: 'Mode',       value: (st.countType ?? 'interactive') === 'interactive' ? 'Interactive' : 'Simple',        inline: true },
-                    { name: 'Access',     value: st.accessRoleId ? `<@&${st.accessRoleId}>` : 'Admins only',                         inline: true },
-                    { name: 'Saves',      value: `**${st.saves ?? 0}**`,                                                              inline: true },
-                    { name: 'Last',       value: st.lastUserId ? `<@${st.lastUserId}>` : 'Nobody yet',                               inline: true },
+                    { name: 'Channel',    value: st.channelId ? `<#${st.channelId}>` : 'Not set',                                 inline: true },
+                    { name: 'Current',    value: `**${st.current}**`,                                                              inline: true },
+                    { name: 'High',       value: `**${st.highScore}**`,                                                            inline: true },
+                    { name: 'Streak',     value: `**${st.maxStreak}** in a row`,                                                   inline: true },
+                    { name: 'Expr',       value: st.allowExpressions ? 'Allowed' : 'Disabled',                                     inline: true },
+                    { name: 'Mode',       value: `${modeEmoji} ${MODE_LABEL[st.countType ?? 'interactive']}`,                     inline: true },
+                    { name: 'Access',     value: st.accessRoleId ? `<@&${st.accessRoleId}>` : 'Admins only',                      inline: true },
+                    { name: 'Saves',      value: `**${st.saves ?? 0}**`,                                                           inline: true },
+                    { name: 'Last',       value: st.lastUserId ? `<@${st.lastUserId}>` : 'Nobody yet',                            inline: true },
+                    ...extraFields,
                 )] });
             }
             if (sub === 'access') {
                 if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return interaction.reply({ content: 'Admins only.', ...ep() });
                 const state = await getState(gid);
-                return interaction.reply({ embeds: [E('#5865F2', 'Access Config').setDescription('Select a role that can use `/config` commands. Admins always have access.').addFields({ name: 'Current role', value: state.accessRoleId ? `<@&${state.accessRoleId}>` : 'None (admins only)' })], components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`access_role_${gid}`).setPlaceholder('Select role').setMinValues(1).setMaxValues(1))], ...ep() });
+                return interaction.reply({ embeds: [E('#5865F2', 'Access Config').setDescription('Select a role that can use `/config` commands.').addFields({ name: 'Current role', value: state.accessRoleId ? `<@&${state.accessRoleId}>` : 'None (admins only)' })], components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`access_role_${gid}`).setPlaceholder('Select role').setMinValues(1).setMaxValues(1))], ...ep() });
             }
             if (!await hasPerm(interaction, gid)) return interaction.reply({ content: 'No permission.', ...ep() });
             if (sub === 'counttype') {
                 const state = await getState(gid);
                 return interaction.reply({
                     embeds: [E('#5865F2', 'Count Type').setDescription('Choose a counting mode:').addFields(
-                        { name: 'Interactive', value: 'Wrong numbers reset the count. Streaks, saves, and reactions all apply.', inline: true },
-                        { name: 'Simple',      value: 'Wrong messages are silently deleted. The count never resets.',            inline: true },
-                    ).addFields({ name: 'Current mode', value: (state.countType ?? 'interactive') === 'interactive' ? '**Interactive**' : '**Simple**' })],
+                        { name: '🎮 Interactive', value: 'Wrong numbers reset the count. Streaks, saves, and reactions apply.',         inline: true },
+                        { name: '🟢 Simple',      value: 'Wrong messages are silently deleted. Count never resets.',                    inline: true },
+                        { name: '⏳ Countdown',   value: 'Count DOWN from 100 to 1. Complete cycles for glory!',                       inline: true },
+                        { name: '🎲 Random',      value: 'Interactive with a random modifier (primes, Fibonacci, etc.) that changes on each reset!', inline: true },
+                        { name: 'Current mode', value: `**${MODE_EMOJI[state.countType ?? 'interactive']} ${MODE_LABEL[state.countType ?? 'interactive']}**` },
+                    )],
                     components: [countTypeRow(state.countType ?? 'interactive')],
                     ...ep(),
                 });
             }
             await interaction.deferReply(ep());
             const state = await getState(gid);
-            if (sub === 'channel') { const ch = options.getChannel('channel'); if (!ch.isTextBased()) return interaction.editReply({ content: 'Text channel required.' }); state.channelId = ch.id; saveState(gid, state); return interaction.editReply({ embeds: [E('#5865F2', 'Channel set').setDescription(`Counting channel set to ${ch}. Start from **1**!`)] }); }
-            if (sub === 'setcount') { const num = options.getInteger('number'), prev = state.current; state.current = num; state.lastUserId = null; state.consecutiveCount = 0; if (num > state.highScore) state.highScore = num; saveState(gid, state); if (state.channelId) { const ch = interaction.guild.channels.cache.get(state.channelId); if (ch) ch.send({ embeds: [E('#5865F2', 'Count set').setDescription(`Count set from **${prev}** to **${num}**. Next: **${num + 1}**.`)] }).catch(() => {}); } return interaction.editReply({ content: `Count set to **${num}**. Next: **${num + 1}**.` }); }
+            if (sub === 'channel') {
+                const ch = options.getChannel('channel');
+                if (!ch.isTextBased()) return interaction.editReply({ content: 'Text channel required.' });
+                state.channelId = ch.id; saveState(gid, state);
+                return interaction.editReply({ embeds: [E('#5865F2', 'Channel set').setDescription(`Counting channel set to ${ch}. Start from **1**!`)] });
+            }
+            if (sub === 'setcount') {
+                const num = options.getInteger('number'), prev = state.current;
+                if (state.countType === 'countdown') { state.current = num; }
+                else { state.current = num; if (num > state.highScore) state.highScore = num; }
+                state.lastUserId = null; state.consecutiveCount = 0;
+                saveState(gid, state);
+                if (state.channelId) { const ch = interaction.guild.channels.cache.get(state.channelId); if (ch) ch.send({ embeds: [E('#5865F2', 'Count set').setDescription(`Count set from **${prev}** to **${num}**. Next: **${state.countType === 'countdown' ? num - 1 : num + 1}**.`)] }).catch(() => {}); }
+                return interaction.editReply({ content: `Count set to **${num}**.` });
+            }
             if (sub === 'maxstreak')   { state.maxStreak = options.getInteger('amount'); saveState(gid, state); return interaction.editReply({ embeds: [E('#5865F2', 'Max streak updated').setDescription(state.maxStreak === 1 ? 'Users can\'t count twice in a row.' : `Users can count **${state.maxStreak}** times in a row.`)] }); }
             if (sub === 'expressions') { state.allowExpressions = options.getBoolean('enabled'); saveState(gid, state); return interaction.editReply({ embeds: [E('#5865F2', `Expressions ${state.allowExpressions ? 'enabled' : 'disabled'}`).setDescription(state.allowExpressions ? 'Expressions like `1+1`, `pi^2` are now allowed.' : 'Only plain numbers accepted.')] }); }
         }
@@ -905,9 +1325,25 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferReply(ep());
             const state = await getState(gid);
             if (sub === 'reset') {
-                const prev = state.current; state.current = 0; state.lastUserId = null; state.consecutiveCount = 0; saveState(gid, state);
-                if (state.channelId) { const ch = interaction.guild.channels.cache.get(state.channelId); if (ch) ch.send({ embeds: [E('#ff9900', '🔄 Count reset').setDescription(`Admin reset from **${prev}** to 0. Start again from **1**!`)] }).catch(() => {}); }
-                return interaction.editReply({ content: `Count reset from **${prev}** to 0.` });
+                const prev = state.current;
+                if (state.countType === 'countdown') {
+                    state.current = state.countdownStart ?? 100;
+                } else if (state.countType === 'random') {
+                    const mod = pickRandomModifier();
+                    state.randomModifier = mod.id; state.randomModifierLabel = mod.label;
+                    state.current = 0;
+                } else {
+                    state.current = 0;
+                }
+                state.lastUserId = null; state.consecutiveCount = 0;
+                saveState(gid, state);
+                const resetTo = state.countType === 'countdown' ? (state.countdownStart ?? 100) : 1;
+                if (state.channelId) {
+                    const ch = interaction.guild.channels.cache.get(state.channelId);
+                    const extra = state.countType === 'random' ? `\nNew modifier: **${state.randomModifierLabel}**` : '';
+                    if (ch) ch.send({ embeds: [E('#ff9900', '🔄 Count reset').setDescription(`Admin reset from **${prev}**. Start again from **${resetTo}**!${extra}`)] }).catch(() => {});
+                }
+                return interaction.editReply({ content: `Count reset from **${prev}**.` });
             }
         }
     } catch (error) {
