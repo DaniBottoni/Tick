@@ -4,7 +4,7 @@ The best counting bot out there, featuring multiply modes, endless customization
 # Commands
 
 ## Config
-- **/config counttype:** Switch between the interactive and simple counting mode.
+- **/config counttype:** Switch between the interactive, simple, countdown and random mode.
 - **/config maxstreak:** Sets the maximum consecutive counts per user.
 - **/config access:** Sets which role can use the config commands.
 - **/config setcount:** Sets the count to any number below 1000 to make it easy to transfer from another bot.
