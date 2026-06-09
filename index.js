@@ -387,13 +387,13 @@ function buildSetupEmbed(state) {
         embeds: [E('#5865F2', '⚙️ Counting Bot — Setup')
             .setDescription('Use the buttons below to configure the bot. All settings are saved instantly.')
             .addFields(
-                { name: '📍 Counting Channel', value: state.channelId ? `<#${state.channelId}>` : 'Not set',             inline: true },
-                { name: '🎮 Count Type',        value: modeDisplay,                                                       inline: true },
-                { name: '🔁 Max Streak',        value: `**${state.maxStreak}** in a row`,                                 inline: true },
-                { name: '🧮 Expressions',       value: state.allowExpressions ? 'Allowed' : 'Disabled',                  inline: true },
-                { name: '🔒 Access Role',       value: state.accessRoleId ? `<@&${state.accessRoleId}>` : 'Admins only', inline: true },
-                { name: '🛡️ Server Saves',     value: `**${state.saves ?? 0}**`,                                         inline: true },
-                { name: '🔢 Current Count',     value: `**${state.current}**`,                                            inline: true },
+                { name: 'Counting Channel', value: state.channelId ? `<#${state.channelId}>` : 'Not set',             inline: true },
+                { name: 'Count Type',        value: modeDisplay,                                                       inline: true },
+                { name: 'Max Streak',        value: `**${state.maxStreak}** in a row`,                                 inline: true },
+                { name: 'Expressions',       value: state.allowExpressions ? 'Allowed' : 'Disabled',                  inline: true },
+                { name: 'Access Role',       value: state.accessRoleId ? `<@&${state.accessRoleId}>` : 'Admins only', inline: true },
+                { name: 'Server Saves',     value: `**${state.saves ?? 0}**`,                                         inline: true },
+                { name: 'Current Count',     value: `**${state.current}**`,                                            inline: true },
                 ...extraField,
             )
         ],
@@ -642,8 +642,7 @@ function buildHelpPage(page) {
             { name: 'Rules', value: '• Type the next number\n• Can\'t count twice in a row (default)\n• Wrong number resets to 1!\n• Math expressions supported' },
             { name: 'Correct', value: 'React added, count goes up' },
             { name: 'Wrong / too fast', value: 'Count resets!' },
-            { name: 'Milestones', value: 'Bot celebrates every 100 counts' },
-            { name: 'Saves', value: 'The server earns 1 save every 50 counts. Anyone can use it within 1 minute to undo a ruin!' },
+            { name: 'Milestones', value: 'Bot celebrates every 100 counts, and gives a save on these milestones: 50, 100. 250, 500, 1000, 2000 and after that every 2000.' },
             { name: 'Simple mode', value: 'No resets — wrong messages are silently deleted.' },
         ).setFooter({ text: 'Page 1/5' }),
         E('#5865F2', 'Commands').setDescription('All commands:').addFields(
