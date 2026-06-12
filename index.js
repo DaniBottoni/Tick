@@ -136,12 +136,13 @@ function firstValidForModifier(modId) { const mod=getModifier(modId);let n=1;whi
 async function buildUserStatsEmbed(gid, user) {
     const [st, rank, gs] = await Promise.all([getUserStats(gid,user.id), getUserRank(gid,user.id), getState(gid)]);
     const tot=(st.correct||0)+(st.ruined||0), acc=tot>0?Math.round((st.correct/tot)*100):100;
-    const extra=gs.countType==='countdown'?[{name:'\u23f3 Countdown Cycles',value:`**${gs.countdownCycles??0}**`,inline:true}]:[];
     return E('#5865F2',`\u{1F4CA} Stats \u2014 ${user.username}`).setThumbnail(user.displayAvatarURL()).addFields(
-        {name:'\u2705 Correct',value:`**${st.correct??0}**`,inline:true},{name:'\u{1F4A5} Ruined',value:`**${st.ruined??0}**`,inline:true},{name:'\u{1F3AF} Accuracy',value:`**${acc}%**`,inline:true},
-        {name:'\u{1F3C5} Rank',value:`**#${rank}**`,inline:true},{name:'\u{1F522} Current',value:`**${gs.current}**`,inline:true},{name:'\u{1F3C6} High score',value:`**${gs.highScore}**`,inline:true},
-        {name:'\u{1F6E1}\ufe0f Server saves',value:`**${gs.saves??0}**`,inline:true},{name:'\u{1F516} Saves used',value:`**${gs.savesUsed??0}**`,inline:true},
-        {name:`${MODE_EMOJI[gs.countType??'interactive']} Mode`,value:`**${MODE_LABEL[gs.countType??'interactive']}**`,inline:true},...extra,
+        {name:'\u2705 Correct',value:`**${st.correct??0}**`,inline:true},
+        {name:'\u{1F4A5} Ruined',value:`**${st.ruined??0}**`,inline:true},
+        {name:'\u{1F3AF} Accuracy',value:`**${acc}%**`,inline:true},
+        {name:'\u{1F3C5} Rank',value:`**#${rank}**`,inline:true},
+        {name:'\u{1F516} Saves used',value:`**${st.savesUsed??0}**`,inline:true},
+        {name:`${MODE_EMOJI[gs.countType??'interactive']} Mode`,value:`**${MODE_LABEL[gs.countType??'interactive']}**`,inline:true},
     );
 }
 async function buildServerStatsEmbed(guild) {
@@ -237,7 +238,7 @@ const SUP={'\u2070':'0','\u00b9':'1','\u00b2':'2','\u00b3':'3','\u2074':'4','\u2
 class C{constructor(r=0,i=0){this.r=r;this.i=i;}static of(x){return x instanceof C?x:new C(+x,0);}add(b){b=C.of(b);return new C(this.r+b.r,this.i+b.i);}sub(b){b=C.of(b);return new C(this.r-b.r,this.i-b.i);}mul(b){b=C.of(b);return new C(this.r*b.r-this.i*b.i,this.r*b.i+this.i*b.r);}div(b){b=C.of(b);const d=b.r*b.r+b.i*b.i;if(!d)return new C(NaN,NaN);return new C((this.r*b.r+this.i*b.i)/d,(this.i*b.r-this.r*b.i)/d);}pow(b){b=C.of(b);if(this.r===0&&this.i===0)return(b.r===0&&b.i===0)?new C(1):new C(0);return this.ln().mul(b).exp();}ln(){return new C(Math.log(Math.hypot(this.r,this.i)),Math.atan2(this.i,this.r));}exp(){const e=Math.exp(this.r);return new C(e*Math.cos(this.i),e*Math.sin(this.i));}neg(){return new C(-this.r,-this.i);}sqrt(){const m=Math.hypot(this.r,this.i)**0.5,a=Math.atan2(this.i,this.r)/2;return new C(m*Math.cos(a),m*Math.sin(a));}cbrt(){const m=Math.hypot(this.r,this.i)**(1/3),a=Math.atan2(this.i,this.r)/3;return new C(m*Math.cos(a),m*Math.sin(a));}nthRoot(n){const m=Math.hypot(this.r,this.i)**(1/n),a=Math.atan2(this.i,this.r)/n;return new C(m*Math.cos(a),m*Math.sin(a));}isReal(tol=1e-6){return Math.abs(this.i)<=tol;}}
 const CCONSTS={pi:new C(Math.PI),e:new C(Math.E),phi:new C((1+Math.sqrt(5))/2),tau:new C(Math.PI*2),sqrt2:new C(Math.SQRT2),i:new C(0,1)};
 function lambertW(x){if(x<-1/Math.E)return NaN;let w=x<1?x:Math.log(x);for(let i=0;i<100;i++){const ew=Math.exp(w),f=w*ew-x,df=ew*(w+1);const dw=f/(df-(w+2)*f/(2*(w+1)));w-=dw;if(Math.abs(dw)<1e-12)break;}return w;}
-const CFUNCS={floor:v=>new C(Math.floor(v.r)),ceil:v=>new C(Math.ceil(v.r)),round:v=>new C(Math.round(v.r)),abs:v=>new C(Math.hypot(v.r,v.i)),ln:v=>new C(Math.log(v.r)),log:v=>new C(Math.log10(v.r)),log2:v=>new C(Math.log2(v.r)),log10:v=>new C(Math.log10(v.r)),exp:v=>new C(Math.exp(v.r)),sin:v=>new C(Math.sin(v.r)),cos:v=>new C(Math.cos(v.r)),tan:v=>new C(Math.tan(v.r)),asin:v=>new C(Math.asin(v.r)),acos:v=>new C(Math.acos(v.r)),atan:v=>new C(Math.atan(v.r)),sinh:v=>new C(Math.sinh(v.r)),cosh:v=>new C(Math.cosh(v.r)),tanh:v=>new C(Math.tanh(v.r)),lambertw:v=>new C(lambertW(v.r)),lw:v=>new C(lambertW(v.r)),w:v=>new C(lambertW(v.r))};
+const CFUNCS={floor:v=>new C(Math.floor(v.r)),ceil:v=>new C(Math.ceil(v.r)),round:v=>new C(Math.round(v.r)),abs:v=>new C(Math.hypot(v.r,v.i)),ln:v=>new C(Math.log(v.r)),log:v=>new C(Math.log10(v.r)),log2:v=>new C(Math.log2(v.r)),log10:v=>new C(Math.log10(v.r)),exp:v=>new C(Math.exp(v.r)),sin:v=>new C(Math.sin(v.r)),cos:v=>new C(Math.cos(v.r)),tan:v=>new C(Math.tan(v.r)),asin:v=>new C(Math.asin(v.r)),acos:v=>new C(Math.acos(v.r)),atan:v=>new C(Math.atan(v.r)),sinh:v=>new C(Math.sinh(v.r)),cosh:v=>new C(Math.cosh(v.r)),tanh:v=>new C(Math.tanh(v.r)),arcsin:v=>new C(Math.asin(v.r)),arccos:v=>new C(Math.acos(v.r)),arctan:v=>new C(Math.atan(v.r)),lambertw:v=>new C(lambertW(v.r)),lw:v=>new C(lambertW(v.r)),w:v=>new C(lambertW(v.r))};
 const CONSTS={phi:(1+Math.sqrt(5))/2,pi:Math.PI,e:Math.E,tau:Math.PI*2,sqrt2:Math.SQRT2};
 function safeMath(expr){
     let s=expr.trim(),norm='';
@@ -246,7 +247,7 @@ function safeMath(expr){
     s=s.replace(/(?<=[\d)])x(?=[\d(])/g,'*').replace(/\*\*/g,'^').replace(/(\d+)\u221a/g,(_,n)=>`nrt${n}(`).replace(/\u221c/g,'nrt4(').replace(/\u221b/g,'cbrt(').replace(/\u221a/g,'sqrt(');
     let tokens=[],k=0;
     while(k<s.length){if(/\d/.test(s[k])||s[k]==='.'){let n='';while(k<s.length&&(/\d/.test(s[k])||s[k]==='.')){ n+=s[k++];}tokens.push({t:'n',v:parseFloat(n)});}else if(/[a-z]/.test(s[k])){let id='';while(k<s.length&&/[a-z0-9]/.test(s[k]))id+=s[k++];tokens.push({t:'id',v:id});}else if('+-*/^(),'.includes(s[k])){tokens.push({t:'op',v:s[k++]});}else k++;}
-    const FUNCS=new Set(['sqrt','cbrt','floor','ceil','round','abs','ln','log','log2','log10','exp','sin','cos','tan','asin','acos','atan','sinh','cosh','tanh','lambertw','lw','w']);
+    const FUNCS=new Set(['sqrt','cbrt','floor','ceil','round','abs','ln','log','log2','log10','exp','sin','cos','tan','asin','acos','atan','arcsin','arccos','arctan','sinh','cosh','tanh','lambertw','lw','w','pow']);
     const isFunc=v=>FUNCS.has(v)||/^nrt\d+$/.test(v);
     const out=[];
     for(let j=0;j<tokens.length;j++){out.push(tokens[j]);const cur=tokens[j],nxt=tokens[j+1];if(!nxt)continue;const lOk=cur.t==='n'||(cur.t==='id'&&!isFunc(cur.v))||(cur.t==='op'&&cur.v===')');const rOk=nxt.t==='n'||nxt.t==='id'||(nxt.t==='op'&&nxt.v==='(');const fc=nxt.t==='op'&&nxt.v==='('&&cur.t==='id'&&isFunc(cur.v);if(lOk&&rOk&&!fc)out.push({t:'op',v:'*'});}
@@ -255,7 +256,7 @@ function safeMath(expr){
     function parseTerm(){let l=parsePow();while(peek()&&(peek().v==='*'||peek().v==='/')){const op=consume().v;const r=parsePow();l=op==='*'?l.mul(r):l.div(r);}return l;}
     function parsePow(){const b=parseUnary();if(peek()&&peek().v==='^'){consume();return b.pow(parsePow());}return b;}
     function parseUnary(){if(peek()&&peek().v==='-'){consume();return parseUnary().neg();}if(peek()&&peek().v==='+'){consume();return parseUnary();}return parseAtom();}
-    function parseAtom(){const tok=peek();if(!tok)throw new Error('unexpected end');if(tok.t==='n'){consume();return new C(tok.v,0);}if(tok.t==='id'){consume();if(peek()&&peek().v==='('){consume();const arg=parseExpr();if(peek()&&peek().v===')')consume();if(tok.v==='sqrt')return arg.sqrt();if(tok.v==='cbrt')return arg.cbrt();if(CFUNCS[tok.v])return CFUNCS[tok.v](arg);if(/^nrt(\d+)$/.test(tok.v))return arg.nthRoot(parseInt(tok.v.slice(3)));throw new Error('unknown fn: '+tok.v);}if(CCONSTS[tok.v])return CCONSTS[tok.v];throw new Error('unknown id: '+tok.v);}if(tok.t==='op'&&tok.v==='('){consume();const val=parseExpr();if(peek()&&peek().v===')')consume();return val;}throw new Error('unexpected: '+JSON.stringify(tok));}
+    function parseAtom(){const tok=peek();if(!tok)throw new Error('unexpected end');if(tok.t==='n'){consume();return new C(tok.v,0);}if(tok.t==='id'){consume();if(peek()&&peek().v==='('){consume();const arg=parseExpr();const arg2=peek()&&peek().v===','?(consume(),parseExpr()):null;if(peek()&&peek().v===')')consume();if(tok.v==='pow'){if(arg2===null)throw new Error('pow requires 2 args');return arg.pow(arg2);}if(tok.v==='sqrt')return arg2===null?arg.sqrt():arg.nthRoot(arg2.r);if(tok.v==='cbrt')return arg.cbrt();if(CFUNCS[tok.v])return CFUNCS[tok.v](arg);if(/^nrt(\d+)$/.test(tok.v))return arg.nthRoot(parseInt(tok.v.slice(3)));throw new Error('unknown fn: '+tok.v);}if(CCONSTS[tok.v])return CCONSTS[tok.v];throw new Error('unknown id: '+tok.v);}if(tok.t==='op'&&tok.v==='('){consume();const val=parseExpr();if(peek()&&peek().v===')')consume();return val;}throw new Error('unexpected: '+JSON.stringify(tok));}
     try{const res=parseExpr();if(!res.isReal()||!isFinite(res.r)||isNaN(res.r))return null;const r=Math.round(res.r);return Math.abs(r)>10_000_000?null:r;}catch{return null;}
 }
 
@@ -306,7 +307,7 @@ function buildHelpPage(page){
         E('#5865F2','Expressions').setDescription('Math expressions, rounded to nearest whole number.').addFields(
             {name:'Operators',value:'`+` `-` `*` `/` `^`'},
             {name:'Constants',value:'`pi` `phi` `e` `tau` `sqrt2`'},
-            {name:'Functions',value:'`ln` `log` `log2` `sqrt` `cbrt` `sin` `cos` `tan` `asin` `acos` `atan` `floor` `ceil` `abs` `exp` `round`'},
+            {name:'Functions',value:'`ln` `log` `log2` `sqrt(x,n)` `cbrt` `pow(x,n)` `sin` `cos` `tan` `asin`/`arcsin` `acos`/`arccos` `atan`/`arctan` `floor` `ceil` `abs` `exp` `round`'},
             {name:'Examples',value:'`ln(e)`\u2192**1** `log(10)`\u2192**1** `sin(pi)`\u2192**0** `pi^2`\u2192**10** `2^8`\u2192**256**'},
             {name:'/calculate',value:'Type a number to get 3 expressions, or type your own expression to evaluate it!'},
         ).setFooter({text:'Page 5/5'}),
@@ -315,6 +316,7 @@ function buildHelpPage(page){
 }
 
 function earnsSave(v){const ms=[50,100,250,500,1000,2000];return ms.includes(v)||(v>2000&&v%2000===0);}
+function nextSaveAt(v){const ms=[50,100,250,500,1000,2000];for(const m of ms)if(v<m)return m;return Math.ceil((v+1)/2000)*2000;}
 function doReset(gid,state,userId){
     if(state.countType==='countdown'){state.current=state.countdownStart??100;}
     else if(state.countType==='random'){const mod=pickRandomModifier();state.randomModifier=mod.id;state.randomModifierLabel=mod.label;state.current=0;}
@@ -440,7 +442,7 @@ client.on('messageCreate',async message=>{
         const same=message.author.id===state.lastUserId;
         state.current=value;state.lastUserId=message.author.id;state.consecutiveCount=same?state.consecutiveCount+1:1;
         if(value>state.highScore)state.highScore=value;saveState(gid,state);updateUserStat(gid,message.author.id,{correct:1});
-        if(earnsSave(value)){state.saves=(state.saves??0)+1;saveState(gid,state);await message.channel.send({embeds:[E('#ffd700','\u{1F6E1}\ufe0f Save earned!').setDescription(`The server earned a **Save** for reaching **${value}**! (**${state.saves}** total)`)]}).catch(()=>{});}
+        if(earnsSave(value)){state.saves=(state.saves??0)+1;saveState(gid,state);await message.channel.send({embeds:[E('#ffd700','\u{1F6E1}\ufe0f Save earned!').setDescription(`The server earned a **Save** for reaching **${value}**! (**${state.saves}** total)\nNext save at **${nextSaveAt(value)}**.`)]}).catch(()=>{});}
         await message.react('\u2705').catch(()=>{});
         if(value%10===0||value<=5)await message.channel.send({embeds:[E('#9b59b6',`\u{1F3B2} ${value}!`).setDescription(`${mod.hint(value)} \u2014 Modifier: **${mod.label}**`)]}).catch(()=>{});
         if(value%100===0)await message.channel.send({embeds:[E('#00cc88',`\u{1F389} ${value} reached!`).setDescription(`The count hit **${value}** thanks to <@${message.author.id}>! \u{1F3B2} Modifier: ${mod.label}`).setFooter({text:`High score: ${state.highScore}`})]}).catch(()=>{});
@@ -455,7 +457,7 @@ client.on('messageCreate',async message=>{
     const same=message.author.id===state.lastUserId;
     state.current=value;state.lastUserId=message.author.id;state.consecutiveCount=same?state.consecutiveCount+1:1;
     if(value>state.highScore)state.highScore=value;saveState(gid,state);updateUserStat(gid,message.author.id,{correct:1});
-    if(earnsSave(value)){state.saves=(state.saves??0)+1;saveState(gid,state);await message.channel.send({embeds:[E('#ffd700','\u{1F6E1}\ufe0f Save earned!').setDescription(`The server earned a **Save** for reaching **${value}**!\nThe server now has **${state.saves}** save(s).`)]}).catch(()=>{});}
+    if(earnsSave(value)){state.saves=(state.saves??0)+1;saveState(gid,state);await message.channel.send({embeds:[E('#ffd700','\u{1F6E1}\ufe0f Save earned!').setDescription(`The server earned a **Save** for reaching **${value}**!\nThe server now has **${state.saves}** save(s). Next save at **${nextSaveAt(value)}**.`)]}).catch(()=>{});}
     await message.react(value<=9?NE[value]:'\u2705').catch(()=>{});
     if(value%100===0)await message.channel.send({embeds:[E('#00cc88',`\u{1F389} ${value} reached!`).setDescription(`The count hit **${value}** thanks to <@${message.author.id}>!`).setFooter({text:`High score: ${state.highScore}`})]}).catch(()=>{});
 });
@@ -465,6 +467,7 @@ client.on('interactionCreate',async interaction=>{
     if(interaction.isButton()){
         const id=interaction.customId;
         if(id.startsWith('help_')){const p=parseInt(id.split('_')[1]);if(!isNaN(p)&&p>=1&&p<=5)return interaction.update(buildHelpPage(p));}
+        if(id.startsWith('calc_copy_')){const parts=id.split('_');const expr=parts.slice(3).join('_');return interaction.reply({content:`\`${expr}\`\nTap and hold to copy — then paste it in the counting channel!`,...ep()});}
         if(id.startsWith('setup_')){
             if(!interaction.member.permissions.has(PermissionFlagsBits.Administrator))return interaction.reply({content:'Admins only.',...ep()});
             const state=await getState(gid);
@@ -554,7 +557,7 @@ client.on('interactionCreate',async interaction=>{
         if(cmd==='calculate'){
             await interaction.deferReply(ep());
             const input=options.getString('input').trim(),evaluated=safeMath(input),looksLikeNumber=/^[\d]+$/.test(input.replace(/\s/g,''));
-            if(looksLikeNumber&&evaluated!==null){const exprs=generateExpressions(evaluated);return interaction.editReply({embeds:[E('#5865F2',`Ways to write ${evaluated}`).setDescription(`3 expressions for **${evaluated}**:`).addFields(...exprs.map((x,i)=>({name:`${['\u0031\ufe0f\u20e3','\u0032\ufe0f\u20e3','\u0033\ufe0f\u20e3'][i]} \`${x}\``,value:`= **${safeMath(x)??evaluated}**`,inline:true}))).setFooter({text:'Supports: + - * / ^ pi phi e tau sqrt2 \u00b7 ln log sin cos tan sqrt cbrt'})]});}
+            if(looksLikeNumber&&evaluated!==null){const exprs=generateExpressions(evaluated);const copyRow=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`calc_copy_0_${exprs[0]}`).setLabel(`Copy: ${exprs[0]}`).setStyle(ButtonStyle.Secondary),new ButtonBuilder().setCustomId(`calc_copy_1_${exprs[1]}`).setLabel(`Copy: ${exprs[1]}`).setStyle(ButtonStyle.Secondary),new ButtonBuilder().setCustomId(`calc_copy_2_${exprs[2]}`).setLabel(`Copy: ${exprs[2]}`).setStyle(ButtonStyle.Secondary),);return interaction.editReply({embeds:[E('#5865F2',`Ways to write ${evaluated}`).setDescription(`3 expressions for **${evaluated}**:`).addFields(...exprs.map((x,i)=>({name:`${['\u0031\ufe0f\u20e3','\u0032\ufe0f\u20e3','\u0033\ufe0f\u20e3'][i]} \`${x}\``,value:`= **${safeMath(x)??evaluated}**`,inline:true}))).setFooter({text:'Supports: + - * / ^ pi phi e tau sqrt2 \u00b7 ln log sin cos tan sqrt cbrt'})],components:[copyRow]});}
             if(evaluated!==null)return interaction.editReply({embeds:[E('#5865F2','Result').addFields({name:'Expression',value:`\`${input}\``,inline:true},{name:'Result',value:`**${evaluated}**`,inline:true}).setFooter({text:'Rounded to nearest whole number'})]});
             return interaction.editReply({embeds:[E('#ff4444','Invalid expression').setDescription(`\`${input}\` couldn't be evaluated.\n\nConstants: \`pi\` \`phi\` \`e\` \`tau\` \`sqrt2\``)]});
         }
