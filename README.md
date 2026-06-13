@@ -19,6 +19,6 @@ The best counting bot out there, featuring multiply modes, endless customization
 - **/leaderboard highscores:** Shows the top highscores.
 
 ## Other
-**/calculate:** Enter a number to get 3 ways to calculate it or enter an expression to evaluate it.
-**/invite:** Generates an invite link with all the needed permissions.
-**/help:** Lists all the commands and provides other useful info.
+- **/calculate:** Enter a number to get 3 ways to calculate it or enter an expression to evaluate it.
+- **/invite:** Generates an invite link with all the needed permissions.
+- **/help:** Lists all the commands and provides other useful info.
