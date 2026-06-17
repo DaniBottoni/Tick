@@ -14,6 +14,7 @@ async function initDB() {
         CREATE TABLE IF NOT EXISTS user_stats (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, data JSONB NOT NULL DEFAULT '{}', PRIMARY KEY (guild_id, user_id));
         CREATE INDEX IF NOT EXISTS user_stats_user ON user_stats(user_id);
         CREATE TABLE IF NOT EXISTS dedup (message_id TEXT PRIMARY KEY, claimed_at TIMESTAMPTZ DEFAULT NOW());
+        CREATE TABLE IF NOT EXISTS support_announced (guild_id TEXT PRIMARY KEY, announced_at TIMESTAMPTZ DEFAULT NOW());
     `);
     pool.query(`DELETE FROM dedup WHERE claimed_at < NOW() - INTERVAL '5 minutes'`).catch(() => {});
 }
@@ -245,6 +246,7 @@ function safeMath(expr){
     for(let k=0;k<s.length;k++){if(SUP[s[k]]!==undefined){let sup='';while(k<s.length&&SUP[s[k]]!==undefined)sup+=SUP[s[k++]];norm+='^'+sup;k--;}else norm+=s[k];}
     s=norm.replace(/[\u00d7\u00b7\u2022]/g,'*').replace(/\u00f7/g,'/').replace(/\u2212/g,'-').replace(/\s+/g,'').toLowerCase();
     s=s.replace(/(?<=[\d)])x(?=[\d(])/g,'*').replace(/\*\*/g,'^').replace(/(\d+)\u221a/g,(_,n)=>`nrt${n}(`).replace(/\u221c/g,'nrt4(').replace(/\u221b/g,'cbrt(').replace(/\u221a/g,'sqrt(');
+    if(/[+\-]{2,}/.test(s))return null;
     let tokens=[],k=0;
     while(k<s.length){if(/\d/.test(s[k])||s[k]==='.'){let n='';while(k<s.length&&(/\d/.test(s[k])||s[k]==='.')){ n+=s[k++];}tokens.push({t:'n',v:parseFloat(n)});}else if(/[a-z]/.test(s[k])){let id='';while(k<s.length&&/[a-z0-9]/.test(s[k]))id+=s[k++];tokens.push({t:'id',v:id});}else if('+-*/^(),'.includes(s[k])){tokens.push({t:'op',v:s[k++]});}else k++;}
     const FUNCS=new Set(['sqrt','cbrt','floor','ceil','round','abs','ln','log','log2','log10','exp','sin','cos','tan','asin','acos','atan','arcsin','arccos','arctan','sinh','cosh','tanh','lambertw','lw','w','pow']);
@@ -290,6 +292,7 @@ function buildHelpPage(page){
             {name:'Config',value:'`/config channel` `/config setcount` `/config view` `/config maxstreak` `/config expressions` `/config access` `/config counttype`'},
             {name:'Stats',value:'`/stats [user]` `/leaderboard server` `/leaderboard global` `/leaderboard highscores`'},
             {name:'Utilities',value:'`/calculate [expression]` `/invite` `/help` `/setup`'},
+            {name:'\u{1F6E0}\ufe0f Support Server',value:`Need help or want to report a bug? [Join the support server](${SUPPORT_URL})`},
         ).setFooter({text:'Page 2/5'}),
         E('#5865F2','Config').setDescription('Requires Administrator or configured access role.').addFields(
             {name:'/config maxstreak <n>',value:'Max consecutive counts per user (1\u2013100)'},
@@ -357,6 +360,28 @@ async function triggerRuin(channel,gid,state,userId,reason){
     }
 }
 
+const SUPPORT_URL='https://discord.gg/Qrp82cRhUW';
+async function hasAnnouncedSupport(gid){try{const r=await pool.query('SELECT 1 FROM support_announced WHERE guild_id=$1',[gid]);return r.rowCount>0;}catch{return true;}}
+function markSupportAnnounced(gid){pool.query('INSERT INTO support_announced (guild_id) VALUES ($1) ON CONFLICT (guild_id) DO NOTHING',[gid]).catch(()=>{});}
+function pickAdminChannel(guild){
+    const text=guild.channels.cache.filter(c=>c.isTextBased&&c.isTextBased()&&c.viewable);
+    const botMember=guild.members.me;
+    const canSend=ch=>botMember&&ch.permissionsFor(botMember)?.has(PermissionFlagsBits.SendMessages);
+    const adminOnly=text.filter(ch=>{
+        if(!canSend(ch))return false;
+        const everyone=guild.roles.everyone;
+        const everyonePerms=ch.permissionsFor(everyone);
+        return everyonePerms&&!everyonePerms.has(PermissionFlagsBits.ViewChannel);
+    });
+    const nameMatch=ch=>/admin|staff|mod|owner|management/i.test(ch.name);
+    return adminOnly.find(nameMatch)??adminOnly.first()??text.filter(canSend).find(nameMatch)??guild.systemChannel??text.filter(canSend).first()??null;
+}
+async function announceSupportServer(guild){
+    if(await hasAnnouncedSupport(guild.id))return;
+    const ch=pickAdminChannel(guild);
+    if(ch){await ch.send({embeds:[E('#5865F2','\u{1F44B} Thanks for adding Counting Bot!').setDescription(`Need help, want to report a bug, or have a feature request?\nJoin the support server: ${SUPPORT_URL}`)]}).catch(()=>{});}
+    markSupportAnnounced(guild.id);
+}
 function keepAlive(){const ping=()=>{const u=process.env.RENDER_EXTERNAL_URL||`http://localhost:${process.env.PORT||3000}`;(u.startsWith('https')?require('https'):http).get(u,()=>{}).on('error',()=>{});};setTimeout(ping,5000);setInterval(ping,14*60*1000);}
 
 client.once('ready',async()=>{
@@ -385,7 +410,9 @@ client.once('ready',async()=>{
     await client.application.commands.set(cmds);console.log('Commands registered');
     try{await initDB();const r=await pool.query('SELECT guild_id,data FROM counting');for(const{guild_id,data}of r.rows)stateCache.set(guild_id,data);console.log(`Loaded ${r.rows.length} guild(s)`);}catch(e){console.error('DB init failed:',e.message);}
     keepAlive();
+    for(const guild of client.guilds.cache.values()){await announceSupportServer(guild).catch(()=>{});}
 });
+client.on('guildCreate',guild=>{announceSupportServer(guild).catch(()=>{});});
 
 client.on('messageCreate',async message=>{
     if(message.author.bot||!message.guild)return;
